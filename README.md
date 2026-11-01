@@ -68,21 +68,8 @@ server setup are under [more ways to install](#more-ways-to-install).
 | Voice | Wake phrase, live conversation, dictation | Varies by tool | Varies by provider |
 | Open source | Yes, Apache 2.0 | Varies: Codex CLI and OpenCode are, Claude Code is not | Usually not |
 
-## Code by talking
 
-https://github.com/user-attachments/assets/1daa832e-a566-4f22-add6-8b21eb8aaaad
 
-Talk to Kylo and it hands the work to your coding agents. In this recording
-(made before the rename) one spoken sentence starts a new Claude Code session
-that digs into the app's performance. In the Agentic IDE every pane has a call
-sign, so you can also say "T1, run the tests" or "T2, fix whatever T1 finds".
-Kylo turns each sentence into a full, project-aware brief, asks first when a
-call sign is unclear, and the work keeps going after you hang up.
-[How it works](https://github.com/charanbalaji2005/Kylo/blob/main/docs/product/extend-and-automate/agentic-ide.md#send-clear-work)
-
-## Run every coding agent at once
-
-https://github.com/user-attachments/assets/83c50d16-8c3c-420f-baab-e6d06381307b
 
 The Agentic IDE turns one screen into a room full of coding agents. Open a
 project, split it into panes and start any coding tool you have installed in each
