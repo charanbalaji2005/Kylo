@@ -1,0 +1,24 @@
+{
+  "name": "kylo-desktop",
+  "productName": "Kylo",
+  "version": "1.0.0",
+  "description": "Kylo — AI Agent Development Environment. Your AI. Your Terminal. Your Workflow.",
+  "license": "Apache-2.0",
+  "author": "Kylo",
+  "private": true,
+  "main": "build/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test build/test/",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --win nsis --x64 --publish never",
+    "dist:dir": "npm run build && electron-builder --win dir --x64 --publish never"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.1",
+    "electron": "44.10.1",
+    "electron-builder": "26.17.0",
+    "typescript": "5.9.3"
+  }
+}

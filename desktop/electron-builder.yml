@@ -1,0 +1,51 @@
+# Kylo Windows installer (NSIS) — `npm run dist` in this folder.
+#
+# Inputs:
+#   build/            the compiled Electron main + preload (npm run build)
+#   ../dist/Jarvis/   the frozen Python backend (PyInstaller, kylo.spec) — it
+#                     carries the built web UI (kylo/ui/web/dist) inside it.
+#                     Build it first: see docs/kylo-desktop.md.
+# Output: release/Kylo-Setup-<version>-x64.exe
+appId: com.kylo.desktop
+productName: Kylo
+copyright: "Copyright Kylo contributors. Built on Dodaios (Apache-2.0)."
+directories:
+  output: release
+  buildResources: assets
+files:
+  - build/**/*
+  - "!build/test/**"
+  - assets/**/*
+  - package.json
+extraResources:
+  - from: ../dist/Jarvis
+    to: backend
+    filter: ["**/*"]
+  - from: ../LICENSE
+    to: legal/LICENSE
+  - from: ../NOTICE
+    to: legal/NOTICE
+  - from: ../third_party
+    to: legal/third_party
+    filter: ["**/LICENSE*", "**/NOTICE*", "**/*.md", "**/*.txt", "*.json"]
+asar: true
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: assets/kylo.ico
+  executableName: Kylo
+  artifactName: Kylo-Setup-${version}-x64.${ext}
+  requestedExecutionLevel: asInvoker
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Kylo
+  license: ../LICENSE
+  installerIcon: assets/kylo.ico
+  uninstallerIcon: assets/kylo.ico
+  deleteAppDataOnUninstall: false

@@ -1,11 +1,11 @@
 # Brand Guidelines
 
 The visual language of Kylo: a neutral, cool-black interface with one restrained
-accent, the hooded-figure logo, and a distressed wordmark. The goal is *confident and engineered*,
+accent, the geometric origami K-mark logo, and sleek typography. The goal is *confident and engineered*,
 never noisy or playful.
 
 <p align="center">
-  <img src="../assets/brand/kylo-logo.png" alt="Kylo logo" width="160" />
+  <img src="../assets/brand/kylo-logo.png" alt="Kylo logo" width="360" />
 </p>
 
 ## Color

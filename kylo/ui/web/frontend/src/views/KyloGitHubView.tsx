@@ -147,6 +147,7 @@ export function KyloGitHubView() {
   if (!status.gh_installed || !status.authenticated) {
     return (
       <div className="mx-auto flex h-full max-w-lg flex-col items-center justify-center gap-4 px-6 text-center" data-testid="kylo-github-connect">
+        <img src="/kylo-mark-256.png" alt="Kylo" className="h-12 w-12 object-contain" />
         <h1 className="text-2xl font-semibold">{t("kylo.github.title")}</h1>
         <p className="text-sm text-muted-foreground">{!status.gh_installed ? t("kylo.github.not_installed") : t("kylo.github.not_signed_in")}</p>
         <div className="flex flex-wrap justify-center gap-2">
@@ -179,7 +180,7 @@ export function KyloGitHubView() {
       {/* Account + repositories */}
       <aside className="flex w-80 shrink-0 flex-col border-r border-border">
         <div className="flex items-center gap-3 border-b border-border p-4">
-          {status.avatar_url && <img src={status.avatar_url} alt="" className="h-9 w-9 rounded-full" />}
+          {status.avatar_url ? <img src={status.avatar_url} alt="" className="h-9 w-9 rounded-full" /> : <img src="/kylo-mark-256.png" alt="Kylo" className="h-9 w-9 rounded-lg object-contain" />}
           <div className="min-w-0 flex-1">
             <div className="truncate text-sm font-semibold">{status.name ?? status.login}</div>
             <div className="truncate text-xs text-muted-foreground">

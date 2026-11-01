@@ -77,6 +77,8 @@ KNOWN: frozenset[str] = frozenset(
         "shortcuts",
         # Built for you: what the self-building loop made, with keep and undo.
         "self-build",
+        # The research IDE (a valid SECTION_ID that was missing here).
+        "research-ide",
         # Kylo: integrated terminal, setup dashboard, GitHub, project memory.
         "terminal",
         "kylo-setup",

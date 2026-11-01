@@ -197,6 +197,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "in the background and returns the prompt.",
     )
     parser.add_argument(
+        "--port", type=int, default=None,
+        help="With serve: the port of the web UI / API (overrides [ui].admin_api_port). "
+             "The Kylo desktop shell uses it to run its own backend on a free port.",
+    )
+    parser.add_argument(
+        "--no-lock", action="store_true", dest="no_lock",
+        help="With serve: do not take the single-instance lock.",
+    )
+    parser.add_argument(
         "command",
         nargs="?",
         choices=["serve", "update"],
@@ -653,7 +662,12 @@ def main(argv: list[str] | None = None) -> int:
         # the web launcher so `jarvis serve` == `python -m kylo.ui.web.launcher --headless`.
         from kylo.ui.web import launcher
 
-        return launcher.main(["--headless"])
+        serve_argv = ["--headless"]
+        if args.port is not None:
+            serve_argv += ["--port", str(args.port)]
+        if args.no_lock:
+            serve_argv.append("--no-lock")
+        return launcher.main(serve_argv)
     if _should_run_wizard(args.wizard):
         return _cmd_wizard()
     if args.tray:

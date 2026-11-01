@@ -226,9 +226,12 @@ export function KyloSetupView() {
   return (
     <div className="h-full overflow-auto" data-testid="kylo-setup-view">
       <div className="mx-auto flex max-w-4xl flex-col gap-5 px-6 py-8">
-        <header>
-          <h1 className="text-2xl font-semibold tracking-tight">{t("kylo.setup.title")}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t("kylo.setup.subtitle")}</p>
+        <header className="flex items-center gap-4">
+          <img src="/kylo-logo.png" alt="Kylo" className="h-10 w-auto object-contain" />
+          <div className="min-w-0 flex-1">
+            <h1 className="text-2xl font-semibold tracking-tight">{t("kylo.setup.title")}</h1>
+            <p className="mt-0.5 text-sm text-muted-foreground">{t("kylo.setup.subtitle")}</p>
+          </div>
         </header>
         {message && (
           <div className={cn("rounded-lg px-3 py-2 text-sm", message.tone === "ok" ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : "bg-red-500/10 text-red-600 dark:text-red-400")}>

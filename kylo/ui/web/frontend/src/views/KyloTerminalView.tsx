@@ -409,7 +409,7 @@ export function KyloTerminalView() {
           title={workspace ?? t("kylo.workspace.none")}
           data-testid="kylo-workspace-button"
         >
-          <FolderOpen className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <img src="/kylo-mark-256.png" alt="Kylo" className="h-4 w-4 shrink-0 object-contain" />
           <span className="truncate">{workspace ?? t("kylo.workspace.choose")}</span>
         </button>
         <div className="relative flex">

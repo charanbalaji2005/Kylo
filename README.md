@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/kylo-logo-on-dark.svg" />
-    <img alt="Kylo" src="assets/brand/kylo-logo-on-light.svg" width="112" />
-  </picture>
+  <img alt="Kylo" src="assets/brand/kylo-logo.png" width="480" />
 </p>
 
 <h1 align="center">Kylo</h1>
