@@ -120,7 +120,14 @@ export type SectionId =
   // Built for you: everything Kylo built on its own initiative (the
   // self-building loop, docs/self-build.md) — why, how it was checked, what it
   // cost — with keep, undo and the loop's pause in one place.
-  | "self-build";
+  | "self-build"
+  // Kylo: the integrated terminal (user + AI shells), the setup dashboard
+  // (environment, permissions, terminal settings), GitHub through gh, and the
+  // persistent per-project memory.
+  | "terminal"
+  | "kylo-setup"
+  | "github"
+  | "project-memory";
 
 export const SECTION_IDS = [
   "chats",
@@ -165,6 +172,10 @@ export const SECTION_IDS = [
   "agentic-ide-classic",
   "marketplace",
   "self-build",
+  "terminal",
+  "kylo-setup",
+  "github",
+  "project-memory",
 ] as const satisfies readonly SectionId[];
 
 export function isSectionId(value: unknown): value is SectionId {
@@ -264,6 +275,10 @@ export const SECTION_LABELS: Record<SectionId, string> = {
   "agentic-ide-classic": "Terminal grid",
   marketplace: "Marketplace",
   "self-build": "Built for you",
+  terminal: "Terminal",
+  "kylo-setup": "Setup",
+  github: "GitHub",
+  "project-memory": "Project Memory",
 };
 /**
  * i18n keys for `SECTION_LABELS`, for user-facing readbacks (the voice-navigation
@@ -310,6 +325,10 @@ export const SECTION_LABEL_KEYS: Record<SectionId, string> = {
   "agentic-ide-classic": "quick_switch.terminal_grid",
   marketplace: "nav.marketplace",
   "self-build": "nav.self_build",
+  terminal: "nav.terminal",
+  "kylo-setup": "nav.kylo_setup",
+  github: "nav.github",
+  "project-memory": "nav.project_memory",
 };
 
 export interface EventItem {

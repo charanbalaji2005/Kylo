@@ -136,6 +136,18 @@ const MarketplaceView = lazyView(["marketplace"], () =>
     default: m.MarketplaceView,
   })),
 );
+const KyloTerminalView = lazyView(["terminal"], () =>
+  import("@/views/KyloTerminalView").then((m) => ({ default: m.KyloTerminalView })),
+);
+const KyloSetupView = lazyView(["kylo-setup"], () =>
+  import("@/views/KyloSetupView").then((m) => ({ default: m.KyloSetupView })),
+);
+const KyloGitHubView = lazyView(["github"], () =>
+  import("@/views/KyloGitHubView").then((m) => ({ default: m.KyloGitHubView })),
+);
+const KyloMemoryView = lazyView(["project-memory"], () =>
+  import("@/views/KyloMemoryView").then((m) => ({ default: m.KyloMemoryView })),
+);
 const SelfBuildView = lazyView(["self-build"], () =>
   import("@/views/SelfBuildView").then((m) => ({
     default: m.SelfBuildView,
@@ -542,6 +554,15 @@ function SwitchOnActiveSection({ active }: { active: string }) {
     // Built for you: every self-built thing, with keep, undo and the pause.
     case "self-build":
       return <SelfBuildView />;
+    // Kylo: integrated terminal, setup dashboard, GitHub, project memory.
+    case "terminal":
+      return <KyloTerminalView />;
+    case "kylo-setup":
+      return <KyloSetupView />;
+    case "github":
+      return <KyloGitHubView />;
+    case "project-memory":
+      return <KyloMemoryView />;
     case "research-ide":
       return <ResearchIdeView />;
     // Deliberately nothing: the coding workspace is rendered by the STICKY

@@ -77,6 +77,11 @@ KNOWN: frozenset[str] = frozenset(
         "shortcuts",
         # Built for you: what the self-building loop made, with keep and undo.
         "self-build",
+        # Kylo: integrated terminal, setup dashboard, GitHub, project memory.
+        "terminal",
+        "kylo-setup",
+        "github",
+        "project-memory",
     }
 )
 
@@ -263,6 +268,17 @@ _ALIASES: dict[str, str] = {
     # The marketplace. "store"/"shop" are the words people actually reach for,
     # and none of these names anything else in the app.
     "built for you": "self-build",
+    "terminal": "terminal",
+    "terminals": "terminal",
+    "ai terminal": "terminal",
+    "setup": "kylo-setup",
+    "environment": "kylo-setup",
+    "permissions": "kylo-setup",
+    "autonomy": "kylo-setup",
+    "github": "github",
+    "repositories": "github",
+    "pull requests": "github",
+    "project memory": "project-memory",
     "self build": "self-build",
     "self-building": "self-build",
     "what you built": "self-build",

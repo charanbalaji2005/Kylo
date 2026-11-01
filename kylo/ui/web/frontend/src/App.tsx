@@ -59,6 +59,7 @@ import { useCreateAgentDialog } from "@/components/society/create/createAgentSto
 import { KyloDock } from "@/components/KyloDock";
 import { CliConnectPoller } from "@/components/CliConnectPoller";
 import { OnboardingGate } from "@/components/onboarding/OnboardingGate";
+import { KyloApprovalDialog } from "@/components/kylo/KyloApprovalDialog";
 import { installDictationFocusTracker } from "@/lib/dictationTarget";
 import { SubscriptionRealtimeTransportBroker } from "@/components/voice/SubscriptionRealtimeTransportBroker";
 import { BrowserRealtimeControl } from "@/components/voice/BrowserRealtimeControl";
@@ -398,6 +399,9 @@ export default function App() {
       <CliConnectPoller />
       {/* Blocking onboarding gate — overlays everything until first-run setup is complete. */}
       <OnboardingGate activeSection={activeSection} />
+      {/* Kylo permission dialog for AI commands / GitHub writes the autonomy
+          policy will not run on its own; listens on /api/terminals/events. */}
+      <KyloApprovalDialog />
       {/* The switcher chord anywhere; the chunk loads on first use. Main window only:
           a detached solo window IS one section, there is nowhere to switch. */}
       {switcherOpen && (

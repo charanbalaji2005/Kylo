@@ -9,7 +9,7 @@
  * A second hand-written list anywhere would be the classic drift trap (AP-4):
  * a section added here would silently never appear on the deck.
  */
-import { Gamepad2, KeyRound, type LucideIcon } from "lucide-react";
+import { Brain, Gamepad2, Github, KeyRound, ListChecks, SquareTerminal, type LucideIcon } from "lucide-react";
 import {
   AgentsIcon,
   ArtifactsIcon,
@@ -158,6 +158,8 @@ export const NAV_GROUPS: NavItem[][] = [
     },
     { id: "board", labelKey: "nav.board", icon: BoardIcon },
     { id: "memory", labelKey: "nav.wiki", icon: WikiIcon },
+    // Kylo persistent memory: global, per-project and per-task.
+    { id: "project-memory", labelKey: "nav.project_memory", icon: Brain, fallbackLabel: "Project Memory" },
     { id: "docs", labelKey: "nav.docs", icon: DocsIcon },
   ],
   // 2) Tools — the instruments: transcription, the run inspector, the CLIs
@@ -184,6 +186,11 @@ export const NAV_GROUPS: NavItem[][] = [
       fallbackLabel: "Kylo",
       matchIds: ["research-ide"],
     },
+    // Kylo integrated terminal: your shells (WSL, PowerShell, CMD, Git Bash)
+    // and the AI's terminal side by side.
+    { id: "terminal", labelKey: "nav.terminal", icon: SquareTerminal, fallbackLabel: "Terminal" },
+    // GitHub through the user's own gh login.
+    { id: "github", labelKey: "nav.github", icon: Github, fallbackLabel: "GitHub" },
   ],
   // 3) You — what the assistant knows about the user, and the user's own
   // ledgers.
@@ -206,6 +213,8 @@ export const NAV_GROUPS: NavItem[][] = [
   // Telefonie" voice command lands on the "telephony" id. Settings likewise
   // fronts the former "Taskbar" + "Languages" sections.
   [
+    // Kylo setup: environment detection, permissions, terminal settings.
+    { id: "kylo-setup", labelKey: "nav.kylo_setup", icon: ListChecks, fallbackLabel: "Setup" },
     // Computers: the servers and virtual machines the assistant and its agents
     // can work on besides this one (a rented VPS, a hosting-account import, a
     // local VM). A Settings-hub entry, first under System.

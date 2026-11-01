@@ -335,7 +335,11 @@
     "shortcuts": "Tastenkürzel",
     "pets": "Meine Pets",
     "self_build": "Für dich gebaut",
-    "games": "Spieleinstellungen"
+    "games": "Spieleinstellungen",
+    "terminal": "Terminal",
+    "kylo_setup": "Einrichtung",
+    "github": "GitHub",
+    "project_memory": "Projektgedächtnis"
   },
   "assistant_view": {
     "header_named": "Dein Assistent in {0}, geweckt mit „{1}“.",

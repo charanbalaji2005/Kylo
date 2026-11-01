@@ -335,7 +335,11 @@
     "shortcuts": "键盘快捷键",
     "pets": "我的宠物",
     "self_build": "为你构建",
-    "games": "游戏设置"
+    "games": "游戏设置",
+    "terminal": "终端",
+    "kylo_setup": "设置",
+    "github": "GitHub",
+    "project_memory": "项目记忆"
   },
   "assistant_view": {
     "header_named": "你在 {0} 中的助手，用“{1}”唤醒。",

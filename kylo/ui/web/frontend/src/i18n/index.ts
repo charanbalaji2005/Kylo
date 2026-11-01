@@ -124,7 +124,8 @@ export type LocaleChunk =
   | "pane_review"
   | "memory"
   | "ship"
-  | "self_build";
+  | "self_build"
+  | "kylo";
 
 const SHIP_LOCALES = import.meta.glob("./locales/ship/*.json");
 
@@ -230,6 +231,13 @@ const CHUNK_LOADERS: Record<LocaleChunk, Record<UiLanguage, () => Promise<unknow
     es: () => import("./locales/self_build/es.json"),
     zh: () => import("./locales/self_build/zh.json"),
     pt: () => import("./locales/self_build/pt.json"),
+  },
+  kylo: {
+    en: () => import("./locales/kylo/en.json"),
+    de: () => import("./locales/kylo/de.json"),
+    es: () => import("./locales/kylo/es.json"),
+    zh: () => import("./locales/kylo/zh.json"),
+    pt: () => import("./locales/kylo/pt.json"),
   },
 };
 

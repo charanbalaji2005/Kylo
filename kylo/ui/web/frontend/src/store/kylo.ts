@@ -11,6 +11,7 @@
  */
 import { useEffect } from "react";
 import { create } from "zustand";
+import { translate } from "@/i18n";
 import {
   desktopBridge,
   wsUrl,
@@ -94,7 +95,7 @@ export function applyKyloEvent(event: KyloEvent): void {
       store.setState((s) => ({ approvals: [...s.approvals.filter((a) => a.id !== event.approval.id), event.approval] }));
       const bridge = desktopBridge();
       if (bridge && !document.hasFocus()) {
-        void bridge.notify("Kylo needs your approval", event.approval.title).catch(() => undefined);
+        void bridge.notify(translate("kylo.approval.notify_title"), event.approval.title).catch(() => undefined);
       }
       return;
     }
