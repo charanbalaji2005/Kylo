@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>English</strong> ·
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.zh-CN.md"</a>
 </p>
 
 <p align="center"><strong>Kylo is an open-source agent OS for your desktop: it runs your coding agents, browser and apps by voice or chat, on your own machine.</strong></p>
