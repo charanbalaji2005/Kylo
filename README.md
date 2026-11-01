@@ -157,17 +157,9 @@ needed for pip on Intel Macs and Windows ARM64.
 | Models | [Providers](https://github.com/charanbalaji2005/Kylo/blob/main/docs/product/personalize-and-connect/providers-and-api-keys.md) · [Local models](https://github.com/charanbalaji2005/Kylo/blob/main/docs/product/personalize-and-connect/local-ai-providers.md) |
 | Run and fix | [Server](https://github.com/charanbalaji2005/Kylo/blob/main/docs/headless-vps-deployment.md) · [Architecture](https://github.com/charanbalaji2005/Kylo/blob/main/docs/architecture-overview.md) · [Troubleshooting](https://github.com/charanbalaji2005/Kylo/blob/main/docs/product/privacy-safety-and-support/troubleshooting.md) · [Privacy](https://github.com/charanbalaji2005/Kylo/blob/main/docs/product/privacy-safety-and-support/privacy-and-local-data.md) |
 
-## Contribute
-
-Start with a [good first issue](https://github.com/charanbalaji2005/Kylo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22). If none are open, pick any issue labeled [`help wanted`](https://github.com/charanbalaji2005/Kylo/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) or [`area:docs`](https://github.com/charanbalaji2005/Kylo/issues?q=is%3Aissue+is%3Aopen+label%3Aarea%3Adocs), or ask in [Discussions](https://github.com/charanbalaji2005/Kylo/discussions). [Your first contribution in 10 minutes](https://github.com/charanbalaji2005/Kylo/blob/main/CONTRIBUTING.md#your-first-contribution-in-10-minutes) walks you through it. Security reports follow [SECURITY.md](https://github.com/charanbalaji2005/Kylo/blob/main/SECURITY.md).
 
 A star on GitHub helps other people find Kylo. Sponsors are listed in [SPONSORS.md](https://github.com/charanbalaji2005/Kylo/blob/main/SPONSORS.md).
 
-<!-- contributors:start -->
-
-<a href="https://github.com/rubenluetke10-beep"><img src="https://avatars.githubusercontent.com/u/226271791?v=4&s=48" width="48" height="48" alt="rubenluetke10-beep"></a> <a href="https://github.com/dannyward630"><img src="https://avatars.githubusercontent.com/u/71604164?v=4&s=48" width="48" height="48" alt="dannyward630"></a> <a href="https://github.com/ANO3457"><img src="https://avatars.githubusercontent.com/u/187025195?v=4&s=48" width="48" height="48" alt="ANO3457"></a> <a href="https://github.com/jaydenhawkes123"><img src="https://avatars.githubusercontent.com/u/7899343?v=4&s=48" width="48" height="48" alt="jaydenhawkes123"></a> <a href="https://github.com/CodeByPeace"><img src="https://avatars.githubusercontent.com/u/228503734?v=4&s=48" width="48" height="48" alt="CodeByPeace"></a> <a href="https://github.com/Idee-Wird-App"><img src="https://avatars.githubusercontent.com/u/330157118?v=4&s=48" width="48" height="48" alt="Idee-Wird-App"></a> <a href="https://github.com/tianxingjian2406"><img src="https://avatars.githubusercontent.com/u/247943876?v=4&s=48" width="48" height="48" alt="tianxingjian2406"></a> <a href="https://github.com/Uddoo"><img src="https://avatars.githubusercontent.com/u/19704816?v=4&s=48" width="48" height="48" alt="Uddoo"></a> <!-- i18n-allow -->
-
-<!-- contributors:end -->
 
 ## License
 
