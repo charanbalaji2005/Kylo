@@ -1,0 +1,194 @@
+# Publish Kylo to PyPI on every `v*` tag.
+#
+# No API token and no repository secret is involved: PyPI's Trusted Publishing
+# mints a short-lived, single-use credential from this workflow's OIDC identity.
+# That identity is (owner, repository, workflow FILE NAME, environment), so the
+# values below must match the publisher registered on PyPI exactly — renaming
+# this file or the environment silently breaks every future release:
+#
+#   PyPI projects  kylo, personal-jarvis (both trust the same publisher)
+#   Owner          Kylo
+#   Repository     Kylo
+#   Workflow       release.yml
+#   Environment    pypi
+#
+# Two projects, one code base: the distribution is `kylo`, and every
+# release also publishes `personal-jarvis`, its earlier name, as a thin package
+# with no copy of the code: it depends on `kylo==<this version>` and keeps
+# the earlier commands, so `pip install -U personal-jarvis` and a stored
+# `uvx --from personal-jarvis` keep getting this release
+# (scripts/ci/build_distributions.py). Releases up to 4.1.2 published it as a
+# full copy owning the same package files, which is why install/installer.py
+# removes `personal-jarvis` before it installs `kylo`.
+#
+# The build and the publish are separate jobs on purpose. Only the tiny publish
+# jobs hold `id-token: write` and enter a publishing environment, so the OIDC
+# token is never reachable from the step that executes project code.
+#
+# Each project publishes from its OWN job and environment: PyPI scopes the token
+# it mints to the one trusted publisher that matched, so one job cannot upload to
+# two projects. `kylo` trusts environment `pypi`, `personal-jarvis` trusts
+# environment `pypi-legacy` (both: Kylo/Kylo, release.yml).
+#
+# Action SHAs are pinned to 40-char commits (CVE-2025-30066 hardening), matching
+# the rest of this repo's workflows.
+
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+  # A published version can never be replaced, so a re-run is for the case where
+  # the upload itself failed (network, a mis-registered publisher) while the tag
+  # is already correct.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Release admission (release-gate.yml): tag == version, on main, CI green on
+  # this exact commit. Skipped for a manual run from a branch, which builds
+  # without publishing a release.
+  admit:
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/release-gate.yml
+
+  prepare:
+    name: prepare immutable release
+    needs: admit
+    if: github.ref_type == 'tag' && needs.admit.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Require an unpublished draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/release_assets.py prepare --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME"
+
+
+  build:
+    needs: [admit, prepare]
+    if: ${{ !failure() && !cancelled() }}
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the tagged tree
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install -r scripts/ci/requirements-build.txt
+
+      # A tag that disagrees with the shipped version would publish something
+      # nobody can trace back to a commit. Fail before the artifacts exist.
+      - name: Verify the tag matches the packaged version
+        if: github.ref_type == 'tag'
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          project_version="$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          package_version="$(python -c 'import re,pathlib; print(re.search(r"__version__ = \"([^\"]+)\"", pathlib.Path("kylo/__init__.py").read_text()).group(1))')"
+          echo "tag=${tag_version} pyproject=${project_version} package=${package_version}"
+          if [ "${tag_version}" != "${project_version}" ] || [ "${project_version}" != "${package_version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject (${project_version}) / kylo.__version__ (${package_version})."
+            exit 1
+          fi
+
+      # The README becomes the whole project page, rendered on PyPI's domain
+      # where repo-relative paths do not resolve. Catch them before publishing,
+      # not after someone reports broken images.
+      - name: Verify the README has no repo-relative URLs
+        run: python scripts/ci/check_readme_absolute_urls.py README.md
+
+      # dist/kylo/ and dist/personal-jarvis/: one wheel and one sdist each.
+      - name: Build
+        run: python scripts/ci/build_distributions.py --outdir dist
+
+      # Metadata only. Do NOT read this as "the README was checked": twine maps
+      # `text/markdown` to no renderer at all ("Rendering cannot fail"), so a
+      # Markdown long_description is never rendered here and always passes. The
+      # README's real failure mode is covered by the URL gate above instead.
+      - name: Check the packaging metadata
+        run: python -m twine check --strict dist/*/*
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [admit, prepare, build]
+    if: github.ref_type == 'tag' && needs.admit.result == 'success' && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    environment: pypi
+    timeout-minutes: 10
+    permissions:
+      # The ONLY thing this job is trusted with: minting the OIDC token that
+      # PyPI exchanges for a short-lived upload credential.
+      id-token: write
+    steps:
+      - name: Download the artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      # A re-run after a partial upload skips the files PyPI already holds
+      # (released files are immutable, so they are the ones this tag built).
+      - name: Publish kylo
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/kylo/
+          skip-existing: true
+
+  publish-legacy:
+    name: Publish to PyPI (personal-jarvis, earlier name)
+    needs: [admit, prepare, build]
+    if: github.ref_type == 'tag' && needs.admit.result == 'success' && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    environment: pypi-legacy
+    timeout-minutes: 10
+    permissions:
+      # The ONLY thing this job is trusted with: minting the OIDC token that
+      # PyPI exchanges for a short-lived upload credential.
+      id-token: write
+    steps:
+      - name: Download the artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      # The thin package: existing `pip install personal-jarvis` installs and
+      # stored `uvx --from personal-jarvis` commands follow it to `kylo`.
+      - name: Publish personal-jarvis
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/personal-jarvis/
+          skip-existing: true

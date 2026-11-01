@@ -1,0 +1,672 @@
+# CI/CD pipeline
+
+How a change travels from a coding agent's branch to a user's machine. The
+design fits this repository: several coding agents working in parallel, a
+Python + TypeScript desktop app, three operating systems, and signed
+installers.
+
+```
+agent branch ──► pull request ──► CI (lanes) ──► CI gate ──► merge train ──► merge queue
+                                                                                  │
+                                          main ◄── CI gate (merge_group, full) ◄──┘
+                                            │
+     release-cut (manual) ──► tag ──► release gate ──► PyPI / installers / signatures
+                                                   └─► draft assets ──► finalize ──► updater
+```
+
+## 1. CI — `.github/workflows/ci.yml`
+
+### Tiers: how wide a run is
+
+The organisation has 60 concurrent jobs, 5 of them macOS, shared by every
+agent's pull request. The width of a run therefore follows what the run has
+to prove (`scripts/ci/plan_run.py` emits the tier and every job matrix):
+
+| Tier | When | What runs | Target |
+| --- | --- | --- | --- |
+| `pr` | pull request, branch run dispatched by the merge train | Static gates, the whole Linux + Windows suite, every affected lane on Linux and Windows. No macOS. | ~10 min |
+| `queue` | merge-queue group; a push that reached main without the queue | Everything `pr` runs plus at most two macOS jobs: the macOS tests the change can reach, filled up to about five minutes with the tests that name macOS (one runner), and the Apple Silicon desktop bundle when the macOS lane is affected. The blocking proof of the exact tree main gets. | ~10-13 min |
+| `full` | nightly, release tag, manual full dispatch | The wide matrix: Intel macOS, the ARM runners, every interpreter, the macOS test shards, all three macOS desktop rows, and the Hermes install on Windows. A red nightly opens the issue "Nightly CI is red" (`nightly-alert.yml`). | ~40 min |
+| proven | push to main of a commit the merge queue already passed | `detect` and `CI gate` only. | under 1 min |
+
+A queue group and the push that lands it are one commit, so the push run
+asks the API for a green `merge_group` run of its own SHA and, when there is
+one, turns every lane off. Any doubt (a direct push, an API error) fails open
+to the `queue` tier. A nightly run never accepts an earlier proof.
+
+`CI gate` waits for the slowest job of a run, and several merge groups build
+at once on five macOS slots. The
+first queue runs of this design carried six to eight macOS legs each: three
+groups and one manual full run waited more than half an hour on macOS alone.
+And the Hermes install on Windows (13 minutes of upstream installer before
+the first turn, 14 to 23 minutes a job) was the last job of three in four
+merge groups. The Hermes install on Windows therefore runs nightly and on
+release tags; a regression that only shows there is found by the next
+nightly run, which opens the issue "Nightly CI is red", and at the latest by
+the release run, which blocks publication.
+
+macOS has five runner slots for everything: every pull request, every merge
+group and every rebuild of a group after an entry ahead of it failed. Three
+arrangements were tried on 2026-10-13 and measured:
+
+- macOS legs on every pull request push: pull requests waited 6 to 25
+  minutes for a slot.
+- Every macOS leg of the affected lanes in the merge queue, plus the macOS
+  test shards: a group carried up to eleven macOS jobs, and they waited 30
+  to 54 minutes while the Linux and Windows jobs had long finished.
+- At most two macOS jobs per group, which is what runs now: the macOS tests
+  the change can reach, on one runner (`tests macos impact`), and the Apple
+  Silicon desktop bundle when the macOS lane is affected.
+
+That one runner ended after one to three minutes while the gate waited
+eight to nine for the Windows shards (14 groups on 2026-10-13 with slot
+waits of 7 to 22 seconds; in six of them it ran 40 to 268 of 2,600 test
+files). The selection is therefore
+filled by the duration history up to 660 seconds of test history, about five
+minutes on the runner's three workers (`MAC_BUDGET_SECONDS`): first the
+macOS-focused set, then the tests of the other directories the macOS lane
+watches (dictation, screen capture, install), then every test that names
+macOS, cheapest first. What the change reaches always runs, whatever it
+costs. Replayed on those six groups the job runs 295 to 392 files.
+
+So a test that a change breaks on macOS stops it in the queue, and a broken
+macOS bundle does too. The whole Python suite on macOS runs after the merge
+(see "macOS after the merge" below). What neither proves runs nightly and on
+release tags: the lanes themselves on macOS (realtime contract, updater,
+agent-runtime unit suite on the portable base install, native crypto on
+Intel), both real runtimes and the real browser. A macOS failure there is
+found by the next nightly run, which opens the issue "Nightly CI is red",
+and at the latest by the release run, which blocks publication. A branch can ask for all of it at any time with
+`gh workflow run ci.yml --ref <branch> -f full=false -f include_macos=true`.
+
+The nightly run has no reader waiting for it, so its matrices run one leg at
+a time (`matrix_parallel`) instead of queueing 22 macOS jobs ahead of every
+merge group. Its cron slot is 18:17 UTC: GitHub starts this repository's
+schedules about seven hours late, and the old 02:17 slot ran between 08:30
+and 09:30 UTC, in the working morning.
+
+A branch gets the whole macOS matrix before the queue with
+`gh workflow run ci.yml --ref <branch> -f full=false -f include_macos=true`.
+
+Measured before the tiers (338 runs, 2026-10-07 to 2026-10-12): a run fanned
+out to 46 jobs in the median and up to 69, with 7 to 11 macOS legs; 56 % of
+macOS jobs and 28 % of Linux jobs waited more than five minutes for a runner
+(worst case over two hours); every change ran the suite three times (pull
+request, merge queue, and again on the push of the same commit).
+
+### Jobs
+
+| Stage | What it does | Script |
+| --- | --- | --- |
+| `detect` | Picks the tier and the matrices, then classifies the diff into lanes. Fails open: an empty diff, a pipeline change, the nightly run and a manual run turn every lane on. A merge-queue group is classified against the queue base. Only a push the merge queue already proved turns every lane off. | `scripts/ci/plan_run.py`, `scripts/ci/classify_changes.py` |
+| `static gates` | ~20 repository gates (keys, bundle, AGENTS.md, privacy, docs, CLI coverage, ratchets, bash 3.2, no new German) in one job. Every gate reports. | `scripts/ci/run_gates.py` |
+| `zizmor` / `dependency review` | Workflow security audit on every event (merge queue included, exceptions in `.github/zizmor.yml`); dependency review on pull requests only, failing on an added dependency with a high or critical advisory. `security.yml` keeps the Security-tab uploads. | — |
+| `live third-party sites` | Nightly only and non-blocking: the opt-in live checks of pages the app parses (`JARVIS_LIVE_NETWORK_TESTS=1`, ollama.com's library). A site redesign shows as a failed step and a run warning, never as a red gate. | — |
+| `python contracts (fast)` | Import cleanliness on the bare install, the named contract guards, skill-routing precision and recall, plugin auth. Blocking, no baseline. | — |
+| `tests linux 1..6` | The whole suite in six shards. Batches of files run in fresh processes with a wall-clock budget; a failed batch is re-run file by file, a failed file once more (a pass there is reported as flaky). A file that runs out of its budget alone gets one more attempt with twice that budget, capped at the file ceiling: a file without history starts on the generic floor, and a pass there is reported as flaky and enters the history with its real duration. | `scripts/ci/run_tests_parallel.py` |
+| `tests windows 1..6` | The whole suite in six shards on every tier, pull requests included, so a Windows-only failure blocks the pull request instead of ejecting it from the merge queue. | `scripts/ci/run_tests_parallel.py` |
+| `tests macos 1..3` | The whole suite on macOS: nightly, release and manual runs with macOS only. | — |
+| `tests macos impact` | Merge queue: the macOS tests the change can reach, before it lands, on one runner. A change that reaches everything (the pipeline, conftest, the lockfile) runs the macOS-focused set instead: the tests of the code that asks for or acts on a macOS facility, about 200 files. Either selection is filled up to about five minutes with the tests that name macOS or belong to the macOS lane. Selected once, in `detect`. | `scripts/ci/select_tests.py --one-runner` |
+| `test report + floor` | Proves the six Linux shards cover every discovered file exactly once, enforces the min-passed floor. Detection freezes one shared duration snapshot for all shards, including partial reruns. | `scripts/ci/ratchet_tests.py` |
+| `duration cache` | Runs on main only (nightly, a manual run, a push that bypassed the queue) and only after every Linux and Windows shard succeeded: merges the shard timings into one history per OS, on top of the history the run started from, so a file that was flaky in one run keeps its timing. Windows shards by its own history; until one exists it uses the Linux one. | `scripts/ci/ratchet_tests.py durations` |
+| Lanes | `frontend` (three test shards and the build, side by side), `jarvisctl`, `deps`, `realtime` (+ slim container), `updater` (in-app update, native handover, restart helper), `agent runtimes` (+ slim container + the real Hermes and OpenClaw at their pinned version; see [agent-runtimes.md](agent-runtimes.md#ci-and-release-gates)), `dragdrop`, `browser`, `macOS desktop`, `installer smoke` — each only when its paths change, each as wide as the tier: Linux + Windows on a pull request, + macOS in the merge queue, + Intel and ARM in the wide matrix. | `scripts/ci/plan_run.py` |
+| `release qualification` | Tag CI requires a full run with macOS and the browser-auth E2E evidence gate: a plugin labeled verified needs a completed journey, every completed journey ships as verified, and every other plugin ships labeled preview. The step summary counts both. Ordinary branch/PR/nightly CI skips this release-only job. | `scripts/ci/check_plugin_auth_contract.py --require-e2e-pass` |
+| `CI gate` | Aggregates every job. **The only required check**, on the pull request and again on its merge-queue group. A missing or skipped selected lane fails. Unselected lanes may skip; nightly is strict except event-specific jobs. | `scripts/ci/required_results.py` |
+
+The browser lane drives a real Chrome on a shared runner, where a
+timing-sensitive live test failed in about one run in five. Its failed tests
+get one more run, as failed files do in the test shards: a pass there is
+reported as a flaky warning, a second failure blocks.
+
+The realtime lane runs the subscription authentication, direct reasoning,
+voice transport, session orchestration, native login provisioning and Live catalog contracts on Windows,
+macOS and Linux (macOS from the merge queue on), including the slim container without system audio. These
+focused tests are strict: they do not use the broad-suite failure baseline.
+Their fake credentials and transports also prove that a selected subscription
+cannot fall through to a retained API-key provider when its account is absent
+or unavailable. They make no paid inference calls. Real-account voice tests
+remain separate acceptance evidence.
+
+### macOS after the merge: `.github/workflows/macos-main-sweep.yml`
+
+The whole Python suite on macOS is 24 minutes on one runner, too long for
+every merge group on five slots. It runs after the merge instead: every push
+to main (documentation-only pushes excepted) starts a sweep, one job on one
+macOS runner, with the same runner script and the same macOS baseline as the
+nightly shards. Sweeps share one concurrency group and are never cancelled,
+so one runs at a time and the pending one covers every commit merged
+meanwhile. It is no part of `CI gate`: no pull request and no merge group
+waits for it.
+
+A red sweep opens the issue "macOS tests are red on main" (label
+`macos-main`, written by `nightly-alert.yml`) with the failed job and the
+range of commits between the last green sweep and the first red one; the
+next green sweep closes it. Before, such a failure waited for the nightly
+run, up to a day and thirty to fifty merges later. Check the alert against a
+past sweep with `gh workflow run nightly-alert.yml --ref main -f run_id=<sweep
+run id> -f dry_run=true`.
+
+### Known failures: the ratchet
+
+The suite carries a backlog of failures, mostly platform-specific. They are
+listed per OS in `scripts/ci/test-baseline-<os>.json`. A
+failure in the list is reported and never blocks; any other failure blocks
+the change that introduced it. Whole-file flaky metadata cannot waive a new
+test failure. The list only shrinks: entries not observed in a report need
+proof that the test passed rather than skipped before removal. Regenerate a
+list from a full run with:
+
+```bash
+gh run download <run-id> -p 'tests-linux-*' -D reports
+python scripts/ci/ratchet_tests.py update --out scripts/ci/test-baseline-linux.json reports
+```
+
+Shrink a list with proof instead of by hand: download the `tests-<os>-*`
+artifacts of several full runs on main, one directory per run, and drop every
+entry that passed (not skipped) in all of them:
+
+```bash
+for id in <run-1> <run-2> <run-3>; do gh run download "$id" -p 'tests-linux-*' -D "runs/$id"; done
+python scripts/ci/ratchet_tests.py prune --baseline scripts/ci/test-baseline-linux.json --os linux runs/*
+```
+
+A missing list means no failures have been approved for that OS; new failures
+block immediately. Missing, empty or malformed reports also block.
+
+### Flaky tests
+
+A file that fails inside its batch and passes when re-run alone is reported
+as flaky. That almost always means test-order dependence, and the ratchet does
+not block on it, so it is tracked instead. `test report + floor` lists flaky
+files and new versus known failures in its step summary on every run. After
+each nightly and manual CI run on main (and a push that bypassed the merge
+queue; a push the queue already proved runs no tests and is skipped),
+`.github/workflows/flaky-tests.yml` does the same for every OS and keeps one issue, "Flaky tests on main", updated
+with a rolling table (test file, OS, number of runs it was flaky in, last seen
+run). Rows age out after 30 days without a sighting. That workflow is the only
+place with `issues: write`; it never runs for pull requests and refuses any CI
+run that is not a finished run of this repository's main branch. Record an
+older run by hand with
+`gh workflow run flaky-tests.yml -f run_id=<ci-run-id>`; a run already
+recorded is never counted twice. Logic and tests: `scripts/ci/flaky_report.py`,
+`tests/unit/ci/test_flaky_report.py`.
+
+Static gates include repository workflow policy (immutable action pins, the
+complete aggregate dependency graph, tag-only PyPI publication and draft-only
+asset producers). CI additionally runs pinned Actionlint for workflow syntax,
+expressions and action inputs.
+
+### Dispatch-only evidence runs
+
+`.github/workflows/macos-hotkey-spike.yml` runs only on `workflow_dispatch`: it is
+in no lane, no schedule and not in the `CI gate`. It runs
+`scripts/ci/macos_carbon_hotkey_spike.py` on an Intel and an Apple Silicon macOS runner
+(optionally `macos-26`, whose label for this repository is unverified). The script
+records the TCC context first, then runs each risky Carbon `RegisterEventHotKey`
+variant in a child process so a native crash becomes data, not a failed job. It is
+runner evidence only: runners pre-grant TCC to their tools, show no dialog and have no
+physical keyboard, so its result never decides a default on its own (the flip rule is
+in `macos-permissions.md`, section 4.15). It ran once from the feature branch as run
+`36954304202` at commit `59749f859` on `macos-15` (arm64) and `macos-15-intel` (harness green;
+the recorded result and its limits are in `macos-permissions.md`, section 4.15).
+
+### Concurrency
+
+A pull request keeps only its
+newest run. Every merge-queue entry has its own slot and is never cancelled:
+the queue drops entries it no longer needs itself, and a dropped pending run
+would leave `CI gate` unreported until the queue times out. A run on main is
+never cancelled once it started; pushes to main share one queue slot, so a
+burst of pushes leaves one pending run that covers every commit before it
+instead of a backlog behind the organisation's concurrent-job limit. A push
+the merge queue already proved finishes in under a minute. The nightly run
+and manual runs have their own slots.
+
+## 2. Integrating several agents — merge queue + `.github/workflows/merge-train.yml`
+
+`main` requires a **merge queue** (repository ruleset "main merge queue":
+squash, `CI gate` required). A pull request's own CI is its admission ticket;
+the queue then builds each entry on top of the newest main plus every entry
+ahead of it, runs `ci.yml` on that exact tree (`merge_group` event: the
+`queue` tier, whole Linux + Windows suite plus one short macOS leg per
+affected lane), and squash-merges only when `CI gate` is green there.
+Changes that pass alone and break together stop in the queue instead of on
+main. A failed entry leaves the queue; the entries behind it are rebuilt
+without it.
+
+Agents push branches named `codex/…`, `claude/…`, `agent/…`, `gemini/…`,
+`cursor/…` or `bot/…`, or add the `auto-merge` label to any pull request. The
+merge train runs on every push to main, after every CI run (pull request or
+merge queue), and hourly as a safety net:
+
+1. A pull request that **conflicts** with main (or whose CI, or merge-queue
+   run, failed while it was behind) gets main merged into it
+   (`scripts/ci/agent_integrate.py`). No force push, so an agent that keeps
+   pushing to its branch is never overwritten. A pull request that is merely
+   behind is left alone: the queue re-tests it on the newest main anyway.
+   GitHub computes mergeability on demand, so right after a push to main
+   the train asks again (up to a minute) until it knows which branches
+   that push put in conflict.
+   Three branches are updated per tick. The slots go first to pull requests
+   with green CI that only conflict with main, then to red ones, and last to
+   those already labelled `needs-rebase`: in number order the three oldest
+   pull requests, two of them unresolvable, had held every slot for days.
+2. Conflicts resolve by file class: **generated** files (CLI reference
+   docs, lockfiles, timing caches) take main's copy and are regenerated;
+   the frontend bundle `dist/` is dropped, main tracks none (see
+   "Frontend bundle" below); **append-only** files (CHANGELOG, allowlists,
+   `.gitignore`) are union-merged; **everything else** goes
+   to the optional AI resolver (`ANTHROPIC_API_KEY` → Claude Code,
+   `OPENAI_API_KEY` → Codex CLI, both pinned to exact versions). Its result
+   must leave no conflict markers and must still parse, and CI re-runs on it
+   before anything lands. What stays unresolved aborts cleanly, gets the
+   `needs-rebase` label and a comment listing the files. `git rerere`
+   replays recorded resolutions.
+3. Every green, conflict-free pull request joins the merge queue, pinned to
+   the head commit its CI tested. A head the queue already failed is held
+   until a new push or a train update. Without a queue on main (the
+   rollback path: delete or disable the ruleset) the train squash-merges one
+   green pull request per tick instead.
+
+Opt out with `no-auto-merge`, `do-not-merge`, `wip` or `needs-human`.
+`priority` moves a pull request to the front. Forks and Dependabot never ride
+the train.
+
+**Trust.** The train is three jobs with three privilege levels. `plan` has a
+read-only token and no secrets and runs no pull-request code. `integrate` has
+a read-only token: it merges main into each branch in its own worktree, gives
+the AI resolver its API keys in one step that runs before any pull-request
+code on that machine, then runs the regenerators (pull-request code) and
+hands the result on as git bundles. `apply` holds the write token, runs no
+pull-request code, and only pushes bundles that build on the planned head and
+main, labels, comments, approves parked runs and enqueues. No checkout
+persists a token.
+
+**Token.** The `apply` job runs in the `merge-train` environment (deployable
+from main only) and mints a short-lived token of the "PersonalJarvis Merge
+Bot" GitHub App (variable `MERGE_APP_ID`, environment secret
+`MERGE_APP_PRIVATE_KEY`; contents, pull requests, workflows and actions
+write; no ruleset bypass). Its pushes and enqueues fire the normal events, and
+it may push merges that carry main's `.github/workflows` changes. Without the
+app the train falls back to `GITHUB_TOKEN`: the pull-request run its own push
+triggers waits in "action required" and the train approves it on the next
+tick, and it does not enqueue, because GitHub starts no `merge_group` run for
+an entry `GITHUB_TOKEN` added (the entry would wait until the queue's
+timeout). With no queue on main it merges directly. The merge queue's own
+merges fire the normal push to main.
+
+**Without the app: auto-merge.** A green pull request the train cannot
+enqueue would wait for a person. The repository therefore allows GitHub's
+auto-merge, and `scripts/agent_land.py` requests it with the agent's own
+login (`gh pr merge <branch> --auto --squash`): once `CI gate` is green,
+GitHub adds the pull request to the merge queue itself and the `merge_group`
+run starts normally. A pull request opened another way gets the same with
+that one command. Drafts and the opt-out labels are left alone.
+
+**Watchdog.** A coding agent's session can end before its pull request
+lands. Every tick the train also looks for pull requests that stopped moving
+(`scripts/ci/agent_integrate.py`, `watch_verdict` and `stale_sweep`):
+
+- `stuck`: CI green for 30 min but neither in the merge queue nor set to
+  auto-merge; CI red for 60 min with no new commit; or a conflict the train
+  could not resolve (next to `needs-rebase`). The label comes with one
+  comment per head commit that names the next step ("Request auto-merge:
+  `gh pr merge <n> --auto --squash`", "Fix the failing checks: …"); a hidden
+  marker in that comment keeps later ticks quiet. The label goes as soon as
+  the pull request moves (new head, queued, auto-merge requested, or updated
+  by the train). With the merge bot token a green pull request is simply
+  enqueued, so it only gets the label when the queue refuses it.
+- `stale`: an agent pull request, drafts included, with no commit of its own
+  for 7 days (the train's merges of main do not count) gets the label and
+  the comment "No activity for 7 days; this closes in 7 more days unless
+  labelled `keep`." It is closed after 14 days without a commit, and never
+  before the label has been on it for a full week. `keep`, `needs-human`,
+  `merge-freeze` and the opt-out labels exempt a pull request; Dependabot's
+  are never touched. A new commit lifts the label.
+
+**Merge freeze.** A change that rewrites much of the tree (a package move)
+needs main to stand still until it lands. Its author labels it
+`merge-freeze` (`scripts/ci/merge_freeze.py`). While that label is younger
+than 2 h the train enqueues and merges no other pull request; branch updates,
+approvals and reruns go on. An older label no longer holds main, so a dead
+session cannot freeze it for good; the train says so once on that pull
+request.
+
+The train creates its labels (`stuck`, `stale`, `keep`, `merge-freeze`) the
+first time it sets one. A dry run (the workflow's `dry_run` input, or
+`agent_integrate.py train --dry-run`) lists every label, comment and close it
+would make and makes none.
+
+**Rollback.** If the queue stalls, disable the "main merge queue" ruleset
+(Settings → Rules → Rulesets, or `gh api -X PUT
+repos/<owner>/<repo>/rulesets/<id> -f enforcement=disabled`). The train sees
+no queue on its next tick and merges directly again.
+
+### Locally: `scripts/agent_land.py`
+
+An agent in its own worktree runs one command when its work is done:
+
+```bash
+python scripts/agent_land.py            # feature branch -> PR labelled auto-merge
+python scripts/agent_land.py --direct   # admin only: fast-forward main itself
+```
+
+Local `main` is a mirror of `origin/main`. The commit hook
+(`scripts/ci/check_commit_branch.py`) refuses a commit on it, the
+`reference-transaction` hook refuses every other move of it (`git update-ref`,
+a cherry-pick, a rebase, `--no-verify`) to a commit no remote `main` contains,
+and the script refuses to land from it. Work starts on a branch cut from
+`origin/main` (`git worktree add -b <agent>/<topic> <path> origin/main`) and
+the main checkout follows with `git pull --ff-only` once the pull request has
+merged. Hooks come from the checkout a command runs in, so a worktree cut
+before a hook existed does not have it until it is rebased.
+
+It rebases onto the latest main with the same conflict engine, runs the
+static gates, runs the tests the diff can reach, pushes, and asks GitHub to
+queue the pull request once it is green. It refuses a dirty worktree and
+never stashes or force-pushes.
+
+### A branch from before a package move
+
+Moving the Python package directory is one commit whose content is exactly
+the output of `scripts/rename/rewrite_package.py` (`--dry-run` lists what a
+run would do and the hits it cannot decide, `--check` fails while the tree
+still refers to the old layout). A branch cut before that commit is never
+merged across it by hand. Both `agent_land.py` and the merge train bring the
+branch to the last commit of the old layout first, an ordinary update, and
+then replay the move: the script, loaded from the move commit itself, is
+applied to the files the branch changed, every other file is taken from the
+move commit, and the result is committed as a merge of the two. Nothing can
+conflict in that step. The train does it in two ticks, one per step; locally
+it is one run, and from the move onwards the branch is updated by merge, not
+by rebase. Until main carries the new directory none of this runs.
+
+`agent_land.py` runs the branch's own copy of these scripts. A branch cut
+before they could replay a move stops at the move with an ordinary conflict
+report and changes nothing: rebase it onto the last commit of the old layout
+by hand, which brings the scripts along, and run `agent_land.py` again. The
+merge train always runs main's copy and needs no such step.
+
+`classify_changes.py` reads a changed path under either name of the package
+directory as the same path, so the move turns no lane off.
+
+The tree is kept ready for the move, so that the move commit needs no hand
+edits: `--dry-run` reports no undecided hit on main. Three conventions keep it
+that way.
+
+- A test that forbids or blocks imports of the package takes the import names
+  from `tests/package_names.py` instead of spelling one out. After the move it
+  guards the new name and the earlier one, which still resolves to the same
+  modules.
+- A line that carries the old name for another reason (a model id, a folder in
+  somebody's vault, a plugin group written out) ends in a `rename-keep`
+  comment. Where a comment would show up in a document, the file and the name
+  are listed in `UNRESOLVED_PATHS_KEPT` in the script instead.
+- Stored plugin configuration is not rewritten. The marketplace seed catalog
+  and the agent-plugin manifests next to it move as they are (`FROZEN_FILES`):
+  their entries start the bundled servers by module name, an existing install
+  keeps its own copy of that command, and the browser evidence of a plugin is
+  bound to it. Code that has to recognise such a command asks
+  `kylo/marketplace/bundled_servers.py`, which accepts the module under every
+  name in `LEGACY_PACKAGE_NAMES` (`kylo/core/branding.py`) and under the name
+  the package is imported as; the push-time privacy scan restates the same
+  names.
+
+The move also rewrites `install/update-contract.json`, which is how the
+release before it finds the moved package (`docs/desktop-installers.md`). A
+release from before that file existed reads the version in the compatibility
+package instead, finds one no release has, and stops before it changes
+anything.
+
+## 3. Releases, installers and updates
+
+A release happens **only** when the maintainer asks for one.
+
+* **`release-cut.yml`** (manual): refuses unless main is green, bumps
+  `pyproject.toml` + `kylo/__init__.py` + the root package in `uv.lock`, moves the `[Unreleased]` notes (or
+  the Conventional Commits since the last tag) into a dated CHANGELOG section
+  (`scripts/ci/cut_release.py`), lands the candidate through a CI-checked PR
+  and the merge queue, tags the landed commit, and dispatches full CI with macOS on that
+  immutable tag. The tag carries the frontend bundle built from its own
+  sources: the `bundle` job (no secrets, read-only token) runs `npm ci && npm
+  run build` on the landed commit, and the `tag` job commits that
+  `kylo/ui/web/dist` on top as the tag's one extra commit (no commit when
+  main's copy is already identical). `release_admit.py` admits a tag on main
+  or exactly that shape: one parent on main, changes only under
+  `kylo/ui/web/dist/`. So installs and updates always get a matching UI, and
+  main does not have to track the bundle. Its `cut` and `tag` jobs run in the `release-cut` environment, which
+  only `main` may deploy to and which holds the private key of the release
+  bot GitHub App (secret `RELEASE_APP_PRIVATE_KEY`, variable
+  `RELEASE_APP_ID`). Right before each write (candidate push and PR, merge,
+  tag push) the job mints a fresh installation token with
+  `actions/create-github-app-token`; CI waits use `GITHUB_TOKEN`, because an
+  installation token lasts one hour. Bot pushes fire the normal events: the
+  candidate PR runs CI by itself and the new tag starts the publishers, so no
+  duplicate PyPI publication is dispatched. Without the bot
+  (`RELEASE_APP_ID` unset) the job falls back to `GITHUB_TOKEN`, dispatches
+  the publishers itself, and a maintainer must open the candidate PR, since
+  `GITHUB_TOKEN` may not open pull requests here. Resume (`resume_sha`)
+  finishes an already merged version commit: the commit whose parent still
+  has the previous version. A later commit with the same version is refused,
+  and the run names the version commit, because tagging it would ship changes
+  that no CHANGELOG section lists.
+* **`release-gate.yml`** is the first job of `release.yml` (PyPI),
+  `desktop-installers.yml` and `sign-installer.yml`. It admits a tag only
+  when tag, versions and CHANGELOG agree, the commit is on main, and
+  the latest trusted CI workflow run for that tag passed on that exact commit, including
+  `CI gate` and `release qualification` (`scripts/ci/release_admit.py`, waiting
+  while CI still runs). A separate main run cannot replace this tag's evidence.
+  Tag CI is excluded from branch-run cancellation. The checkout, tag and SHA must identify the same commit;
+  failure to fetch main cannot fall back to stale ancestry.
+* The GitHub Release (notes + the resumable source archive, published as
+  `kylo-src.tar.gz` and as `personal-jarvis-src.tar.gz` for installers from
+  before the rename) is staged as a draft. `release_assets.py` waits for all three publishers and
+  verifies each actual publication job in its latest attempt; workflow success
+  with a skipped publication job is insufficient. It
+  verifies required assets and GitHub's stored digests against both checksum
+  manifests, checks the signed payload commit, uploads the source archive and
+  its checksum, and verifies those uploads before publishing. The release-cut
+  `publish` job is the normal finalizer. `release-finalize.yml` shares its
+  per-tag lock but only fires on its own (`workflow_run`) when a person or the
+  release bot started the publishers: publisher runs dispatched with
+  `GITHUB_TOKEN` raise no `workflow_run` event, so without the bot it
+  stays a manual retry path. Finalization can
+  also be retried manually from main with an existing draft tag. Producers
+  never edit release visibility or replace existing asset names. Before an
+  upload, the complete staged set must match any files already present;
+  identical files are reused, conflicting bytes fail before new writes.
+  A same-name upload conflict is accepted only after verifying identical
+  stored bytes. Provenance generation produces a workflow artifact and uses
+  this same uploader, so a publisher retry cannot revert visibility to draft.
+  Re-run failed jobs with their original build artifacts to recover a partial
+  upload; a full rebuild with different bytes requires an explicit decision.
+  When a release cut pushed its tag but publishing did not succeed, its
+  `stranded` job opens (or comments on) the issue "Release vX.Y.Z is tagged
+  but not published" with these recovery steps, so a draft behind a public
+  tag never goes unnoticed.
+  The in-app updater follows `releases/latest`; draft releases remain hidden.
+* **Two names per installer.** Every native installer is published as
+  `Kylo-*` and, with identical bytes, under its earlier `PersonalJarvis-*`
+  name, the only one installs from before the rename look for. Every build
+  produces the `Kylo-*` file; the Windows setup is built and signed as
+  `Kylo-Setup-x64.exe` with the product name `Kylo`, the values the
+  SignPath artifact configuration pins (docs/code-signing-policy.md). After
+  signing, the release job copies each file to its other name
+  (`scripts/ci/installer_aliases.py`), `installers-SHA256SUMS.txt` lists both,
+  and finalization refuses a release whose two names of one installer differ.
+  The copies have a planned end and one switch:
+  `PUBLISH_EARLIER_INSTALLER_NAMES` in `scripts/ci/release_assets.py` (the
+  checksum step reads the required names from `installer_aliases.py --names`,
+  so flipping it needs no workflow edit; see docs/rename/migration-plan.md).
+  The `.deb` is named after its package, `kylo_<version>_amd64.deb`
+  (`personal-jarvis_<version>_amd64.deb` up to 4.1.2).
+* **Two names on PyPI.** `release.yml` builds the wheel and sdist as `kylo`
+  and publishes `personal-jarvis`, the earlier name, as a thin package
+  (`scripts/ci/build_distributions.py`): no copy of the code, one dependency
+  `kylo==<same version>`, every extra mapped to the same `kylo` extra,
+  and every `kylo` console command re-declared through a small launcher
+  (`uv tool install personal-jarvis` only links the named package's commands).
+  Each project publishes from its own job and environment (`publish`/`pypi`
+  for `kylo`, `publish-legacy`/`pypi-legacy` for `personal-jarvis`).
+  Releases up to 4.1.2 published `personal-jarvis` as a full copy owning the
+  same files: plain `pip install -U personal-jarvis` over such a copy installs
+  `kylo` and then deletes its files while removing the old copy (uv is not
+  affected); the launcher then prints the repair command
+  (`pip install --force-reinstall --no-deps kylo==<version>`).
+  `install/installer.py` uninstalls `personal-jarvis` before it installs the
+  checkout, and the app logs one warning when an environment holds a full copy
+  under both names.
+* **Build provenance.** On a tag, `desktop-installers.yml` attests every
+  native installer listed in `installers-SHA256SUMS.txt` (`.exe`, both
+  `.dmg`, `.AppImage`, `.deb`, under both names) with
+  `actions/attest-build-provenance` before the upload. Anyone can check a
+  download:
+
+  ```bash
+  gh attestation verify Kylo-Setup-x64.exe -R Kylo/Kylo
+  ```
+
+  Releases up to and including v2.9.0 predate this and have no attestation.
+* **`release-smoke.yml`** (read-only) checks a published release the way a
+  user meets it: the complete asset set and all manifests against GitHub's
+  stored digests, each OS's installers downloaded and matched against
+  `installers-SHA256SUMS.txt` plus their attestation, a container check
+  (`dpkg-deb`, ELF header, `hdiutil verify`; Authenticode and Gatekeeper are
+  reported, not required), and the released `install-verify.sh` /
+  `install-verify.ps1` in dry-run, no-launch mode on Linux, Windows and
+  macOS (`release-wrapper-smoke.yml`, which `installer-smoke.yml` also runs on
+  Linux). Release cut calls it after publishing and requires attestations; a
+  release published with `GITHUB_TOKEN` fires no `release` event. An
+  attestation lookup that keeps getting a server error (HTTP 5xx, retried
+  twice) fails only when attestations are required; otherwise it is a
+  warning, like a missing attestation on an older release. Re-check any
+  tag with `gh workflow run release-smoke.yml -f tag=vX.Y.Z`.
+
+### When a release is bad: roll forward
+
+PyPI versions and published release assets are immutable, so there is no
+"undo". A rollback is a new, higher patch release. What the updater does
+decides the order of steps:
+
+* Every install path follows GitHub's **Latest** release
+  (`releases/latest`): the native installers' updater, the one-line
+  installer's managed checkout, and the website download buttons
+  (`releases/latest/download/<name>`). A running app caches the answer for
+  30 minutes.
+* An update is offered only when Latest is **strictly newer** than the running
+  version (`_is_newer` in `kylo/ui/web/update_routes.py`). Nothing ever
+  downgrades. A user already on the bad version leaves it only when a newer
+  version is published.
+* A native update downloads the installer from that same release and refuses
+  it unless it matches that release's `installers-SHA256SUMS.txt`, which it
+  trusts only when the release's `installers-update-manifest.json` is signed by
+  the pinned release key and names that release's version
+  (`kylo/core/installer_update.py`, `kylo/core/update_manifest.py`).
+
+Steps:
+
+1. **Confirm.** Reproduce the problem and run
+   `gh workflow run release-smoke.yml -f tag=vX.Y.Z` to see whether the
+   artifacts themselves are broken.
+2. **Stop the spread (optional, minutes).**
+   `gh release edit vX.Y.Z -R Kylo/Kylo --prerelease`
+   takes the release out of Latest, so Latest falls back to the previous
+   release. New downloads and apps on older versions stop receiving the bad
+   one (running apps within their 30-minute cache). Users already on it are
+   not downgraded. Check the result with
+   `gh api repos/Kylo/Kylo/releases/latest --jq .tag_name`.
+3. **Fix forward.** Land the revert or fix on main through a normal PR, then
+   cut a patch: `gh workflow run release-cut.yml -f bump=patch`. The new
+   version is newer than both the bad and the previous release, becomes
+   Latest, reaches every install path, and is smoke-tested by the cut.
+4. **PyPI (optional).** A maintainer may *yank* the bad version on pypi.org.
+   pip then skips it unless someone pins that exact version. Never delete it:
+   the number can never be reused anyway.
+5. **Leave the evidence.** Do not delete the bad release, its assets or its
+   tag, and never re-tag. Installs pinned with `JARVIS_INSTALL_TAG`, the
+   signed manifests and the attestations all point at them. Add a short note
+   to the release body instead.
+
+**Release environments.** Two GitHub environments guard the irreversible
+steps: `pypi` (the PyPI upload in `release.yml`) and `release-signing` (the
+`sign` job of `sign-installer.yml`, the only job that reads the offline
+Ed25519 and ML-DSA-65 private keys, `WAVE2_OFFLINE_KEY_B64` and
+`WAVE4_MLDSA65_KEY_B64`, and the `sign-update-manifest` job of
+`desktop-installers.yml`, which signs the in-app updater's manifest with the
+same Ed25519 key). Both admit deployments from `v*` tags only, never
+from a branch, and administrators cannot bypass that policy. Neither has
+required reviewers: a release runs from `release-cut.yml` to the published
+GitHub Release without an approval pause or a **Review deployments** click.
+The signing keys and the PyPI upload are therefore reachable only from a
+workflow run on a `v*` tag.
+
+**Release tags.** The `release tags` repository ruleset protects
+`refs/tags/v*` against creation, update and deletion. Only the release bot
+GitHub App (the `release-cut` job's installation token, app id in
+`RELEASE_APP_ID`) and the repository admin role may bypass it, so only a
+release cut or an administrator can create a `v*` tag. A tag created that way
+still passes release admission (`release-gate.yml`) before anything is
+published.
+
+PyPI publishing retains a separate OIDC-only job and can run only after tag
+admission. Manual branch runs build packages without publishing or signing.
+Native macOS signing imports the publisher certificate into a temporary
+keychain and cleans it up even when the build fails. Native OS build and
+signing proof still requires hosted runners; local syntax checks cannot prove it.
+
+## 4. Design choices, and what was left out
+
+| Idea | Here |
+| --- | --- |
+| Orchestrator + change classifier, fail-open lanes | `detect` + `classify_changes.py` |
+| One aggregate required check (`all-checks-pass`) | `CI gate` |
+| Per-file process isolation, duration cache written only by main | `run_tests_parallel.py`, batched to amortise this suite's start-up cost |
+| Only PR runs are cancelled; main and release never | `concurrency` block |
+| Strict mode where a skipped lane fails | nightly run |
+| Unrelated-history check | `history` gate |
+| Stable release admits a claim before building | `release-gate.yml` |
+| Autofix PRs with a privileged/unprivileged split | not adopted: generated files are regenerated during integration instead |
+| 96-core runners, daily canary tags, Docker/Nix lanes | not adopted: standard runners, releases stay manual, no such artefacts |
+
+## 5. Security scans — `security.yml`, `scorecard.yml`
+
+All free for public repositories, all report into the Security tab beside
+CodeQL's default setup, and none is part of the required `CI gate`:
+
+* **zizmor** audits the workflow files on every pull request and push to
+  main. Accepted exceptions live in `.github/zizmor.yml`, each with its reason;
+  run `zizmor --config .github/zizmor.yml .github/workflows` locally before
+  touching a workflow. Expressions reach a `run:` block through `env:`, never
+  inline, and a checkout keeps its credential only when that job pushes.
+* **dependency-review** fails a pull request that adds a dependency with a
+  known high or critical advisory.
+* **osv-scanner** checks the shipped lockfiles against osv.dev on main and
+  weekly. It reports and never blocks.
+* **OpenSSF Scorecard** publishes a weekly repository security score.
+
+### Frontend bundle
+
+main does not track the built UI (`kylo/ui/web/dist`, ignored in
+`.gitignore`). Until 2026-10-27 it did, and a bot rebuilt and committed it
+after every frontend merge; those copies were most of the repository's
+history (about 1.6 GB of 2.2 GB packed).
+
+Every release tag carries a bundle built from its own sources:
+`release-cut.yml` builds it in the `bundle` job and the `tag` job commits it
+on top of the release commit (see "Releases" above). Everything that installs
+or packages the product reads a tag: the one-liner installers install the
+newest published release, the in-app updater moves between releases, and
+PyPI, the desktop installers and the source archives are built from the tag.
+The old updater on users' machines requires the bundle to be tracked in the
+tag it moves to, so the tag commit has to stay.
+
+`pin_bundle` in `scripts/ci/agent_integrate.py` drops a `dist/` a branch still
+carries (one cut before the switch), so it never comes back through a pull
+request. A checkout of main builds it locally: `npm run build` in
+`kylo/ui/web/frontend`; the desktop app that follows main does that by
+itself (`main_follow.py`). Never commit the result.
+
+Merge queue: `max_entries_to_build` is 3 (ruleset 24704136; raised from 2 on
+2026-10-26, 12 pull requests were waiting at about 7.5 minutes each).
+
+Dependabot covers npm through security updates only.

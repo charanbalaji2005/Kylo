@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+#
+# Build the distributable Linux AppImage for Kylo.
+#
+#   packaging/linux/build.sh
+#
+# Output (per the release contract):
+#   dist/installers/Kylo-Linux-x86_64.AppImage
+#   dist/installers/kylo_<version>_amd64.deb           (when dpkg-deb exists)
+#
+# The installed names are already the current ones: the Debian package
+# "kylo" (it replaces the earlier "personal-jarvis" package), /opt/Kylo,
+# kylo.desktop and the kylo icon. A release also publishes the AppImage
+# as PersonalJarvis-Linux-x86_64.AppImage, a byte-identical copy for installs
+# from before the rename (scripts/ci/installer_aliases.py).
+#
+# The AppImage is one downloadable file that needs no Python, no pip and no
+# system packages: double-click it to run the app, or call it like the CLI
+# ("./Kylo-Linux-x86_64.AppImage serve"). Both entry points come out
+# of the same PyInstaller onedir freeze.
+#
+# What this AppImage does NOT contain is a native desktop window - read
+# packaging/linux/README.md before changing that; it is a deliberate decision,
+# not an oversight.
+#
+# Knobs:
+#   DRY_RUN=1          print every command instead of running it
+#   PYTHON=...         interpreter to build with (default: python3)
+#   SKIP_FRONTEND=1    never run npm, even when the web bundle is missing
+#   SKIP_PYINSTALLER=1 reuse the freeze already in FREEZE_DIR
+#   FREEZE_DIR=...     PyInstaller onedir output (default: dist/Jarvis)
+#   BUILD_DEB=0        skip the .deb even when dpkg-deb is installed
+#   APPIMAGETOOL=...   use this appimagetool binary instead of downloading one
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DRY_RUN="${DRY_RUN:-0}"
+PYTHON="${PYTHON:-python3}"
+SKIP_FRONTEND="${SKIP_FRONTEND:-0}"
+SKIP_PYINSTALLER="${SKIP_PYINSTALLER:-0}"
+BUILD_DEB="${BUILD_DEB:-1}"
+
+DIST_DIR="${REPO_ROOT}/dist"
+FREEZE_DIR="${FREEZE_DIR:-${DIST_DIR}/Jarvis}"
+OUT_DIR="${DIST_DIR}/installers"
+APPDIR="${DIST_DIR}/AppDir"
+FRONTEND_DIST="${REPO_ROOT}/kylo/ui/web/dist"
+APPIMAGE_PATH="${OUT_DIR}/Kylo-Linux-x86_64.AppImage"
+
+# Pinned build tool. "continuous" is a moving target and an unpinned build tool
+# is an unpinned supply chain, so this is an exact release plus its digest; the
+# download is refused when the digest does not match.
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+APPIMAGETOOL_CACHE="${DIST_DIR}/.build-tools/appimagetool-${APPIMAGETOOL_VERSION}-x86_64.AppImage"
+
+ICON_SOURCE="${REPO_ROOT}/assets/icons/kylo-gigi-256.png"
+# The desktop entry, its icon and the window class share one name
+# (kylo/core/branding.py: LINUX_DESKTOP_ENTRY_FILE_NAME, LINUX_WM_CLASS).
+DESKTOP_FILE_NAME="kylo.desktop"
+# The console command and its earlier name; both ship (kylo.spec builds both).
+CLI_EXE_NAMES=("kylo" "jarvis")
+ICON_FILE_NAME="kylo.png"
+# usr/share/<name> inside the AppDir; AppRun reads its browser-ui marker there.
+SHARE_DIR_NAME="kylo"
+# The Debian package. It takes over from the package under its earlier name:
+# Conflicts + Replaces let dpkg remove that package while installing this one,
+# and Provides keeps anything that depends on the earlier name satisfied.
+DEB_PACKAGE_NAME="kylo"
+LEGACY_DEB_PACKAGE_NAME="personal-jarvis"
+DEB_INSTALL_DIR="/opt/Kylo"
+# The earlier command that opens the app; kept so a launcher, a script or a
+# habit that calls it keeps working.
+LEGACY_APP_COMMAND_NAME="personal-jarvis"
+
+log() { printf '[linux-build] %s\n' "$*"; }
+die() { printf '[linux-build] ERROR: %s\n' "$*" >&2; exit 1; }
+
+run() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+  if [ "${DRY_RUN}" = "1" ]; then
+    return 0
+  fi
+  "$@"
+}
+
+building() { [ "${DRY_RUN}" != "1" ]; }
+
+# --- 0. Host and target -----------------------------------------------------
+
+if building && [ "$(uname -s)" != "Linux" ]; then
+  die "this script builds a Linux AppImage and only runs on Linux (use DRY_RUN=1 to rehearse elsewhere)"
+fi
+if building && [ "$(uname -m)" != "x86_64" ]; then
+  die "the release contract covers x86_64 only; this host is $(uname -m)"
+fi
+
+# --- 1. Web bundle ----------------------------------------------------------
+
+if [ -d "${FRONTEND_DIST}" ] && [ -f "${FRONTEND_DIST}/index.html" ]; then
+  log "web bundle present: ${FRONTEND_DIST}"
+elif [ "${SKIP_FRONTEND}" = "1" ]; then
+  die "web bundle missing and SKIP_FRONTEND=1 - build it with 'npm run build' in kylo/ui/web/frontend"
+else
+  log "web bundle missing - building it"
+  command -v npm >/dev/null 2>&1 || die "npm is required to build the web bundle"
+  (
+    cd "${REPO_ROOT}/kylo/ui/web/frontend"
+    if [ ! -d node_modules ]; then
+      run npm ci
+    fi
+    run npm run build
+  )
+fi
+
+# --- 2. Freeze --------------------------------------------------------------
+
+command -v "${PYTHON}" >/dev/null 2>&1 || die "interpreter not found: ${PYTHON}"
+
+# kylo.spec bundles ./jarvis.toml unconditionally, and that file is
+# .gitignore'd - a fresh clone (every CI runner) does not have one and
+# PyInstaller aborts before it starts. Seed the shipped default so the build
+# works from a clean checkout. On a machine that already has a live config the
+# spec bundles THAT file as-is, which is a privacy question the build cannot
+# answer for the maintainer, so it says so instead of quietly shipping it.
+if [ ! -f "${REPO_ROOT}/jarvis.toml" ]; then
+  [ -f "${REPO_ROOT}/kylo.toml.example" ] \
+    || die "neither jarvis.toml nor kylo.toml.example exists; kylo.spec cannot bundle a default configuration"
+  log "seeding jarvis.toml from kylo.toml.example (clean checkout)"
+  run cp "${REPO_ROOT}/kylo.toml.example" "${REPO_ROOT}/jarvis.toml"
+elif ! cmp -s "${REPO_ROOT}/jarvis.toml" "${REPO_ROOT}/kylo.toml.example"; then
+  log "WARNING: kylo.spec bundles this machine's jarvis.toml into the package, and it differs from kylo.toml.example. Check it carries nothing personal before publishing the build."
+fi
+
+if [ "${SKIP_PYINSTALLER}" = "1" ]; then
+  log "SKIP_PYINSTALLER=1 - reusing ${FREEZE_DIR}"
+else
+  if building; then
+    "${PYTHON}" -c "import PyInstaller" >/dev/null 2>&1 \
+      || die "PyInstaller is not installed for ${PYTHON} (pip install pyinstaller)"
+  fi
+  log "running PyInstaller"
+  (
+    cd "${REPO_ROOT}"
+    run "${PYTHON}" -m PyInstaller kylo.spec --noconfirm --clean
+  )
+fi
+
+# The windowed target is named KyloApp in kylo.spec, because `Kylo`
+# and `kylo` are the SAME path on Windows and on a default macOS volume and
+# the second executable would overwrite the first. Linux has no such problem,
+# but the freeze is shared, so accept the earlier names too rather than pinning
+# one. The freeze also ships the launcher under its earlier name PersonalJarvis.
+GUI_EXE_CANDIDATES=("KyloApp" "PersonalJarvis" "Jarvis")
+GUI_EXE_NAME=""
+if building; then
+  for candidate in "${GUI_EXE_CANDIDATES[@]}"; do
+    if [ -x "${FREEZE_DIR}/${candidate}" ]; then
+      GUI_EXE_NAME="${candidate}"
+      break
+    fi
+  done
+  [ -n "${GUI_EXE_NAME}" ] \
+    || die "PyInstaller produced none of ${GUI_EXE_CANDIDATES[*]} in '${FREEZE_DIR}' - kylo.spec has no windowed EXE target"
+  log "windowed executable: ${GUI_EXE_NAME}"
+else
+  GUI_EXE_NAME="${GUI_EXE_CANDIDATES[0]}"
+fi
+
+# --- 3. AppDir --------------------------------------------------------------
+
+log "assembling the AppDir"
+run rm -rf "${APPDIR}"
+run mkdir -p "${APPDIR}/usr/bin" \
+  "${APPDIR}/usr/share/applications" \
+  "${APPDIR}/usr/share/icons/hicolor/256x256/apps" \
+  "${APPDIR}/usr/share/${SHARE_DIR_NAME}"
+
+if building; then
+  # The whole onedir tree lands in usr/bin so PyInstaller's "_internal next to
+  # the executable" layout keeps working without a wrapper. cp -a preserves the
+  # executable bits and the symlinks inside the freeze.
+  cp -a "${FREEZE_DIR}/." "${APPDIR}/usr/bin/"
+
+  # AppRun and the .desktop entry address the launcher as usr/bin/Jarvis, which
+  # is the name the release contract uses. A symlink keeps that stable whatever
+  # kylo.spec calls the binary; PyInstaller resolves its _internal directory
+  # through /proc/self/exe, which follows the link into the same directory.
+  if [ ! -e "${APPDIR}/usr/bin/Jarvis" ]; then
+    ln -s "${GUI_EXE_NAME}" "${APPDIR}/usr/bin/Jarvis"
+  fi
+  for cli_name in "${CLI_EXE_NAMES[@]}"; do
+    if [ ! -e "${APPDIR}/usr/bin/${cli_name}" ]; then
+      # On Linux both targets are the same program - PyInstaller's console flag
+      # has no meaning here - so a link keeps the CLI entry the contract asks
+      # for even when the spec ships no such executable. Say it loudly: on
+      # Windows and macOS a missing console target is a real gap, not a
+      # cosmetic one.
+      log "WARNING: the freeze has no '${cli_name}' executable - kylo.spec has no console CLI EXE target of that name. Linking it to ${GUI_EXE_NAME} so the CLI entry exists."
+      ln -s "${GUI_EXE_NAME}" "${APPDIR}/usr/bin/${cli_name}"
+    fi
+  done
+else
+  log "[dry-run] would copy ${FREEZE_DIR}/. into ${APPDIR}/usr/bin/ and link Jarvis/${CLI_EXE_NAMES[*]} to ${GUI_EXE_NAME}"
+fi
+
+run "${PYTHON}" "${SCRIPT_DIR}/make_desktop_entry.py" \
+  "${APPDIR}/usr/share/applications/${DESKTOP_FILE_NAME}" --exec Jarvis \
+  --icon "${ICON_FILE_NAME%.png}"
+
+[ -f "${ICON_SOURCE}" ] || die "icon master missing: ${ICON_SOURCE}"
+run cp "${ICON_SOURCE}" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/${ICON_FILE_NAME}"
+
+# The AppImage specification wants the desktop entry, the icon and .DirIcon in
+# the AppDir ROOT; appimagetool refuses to build without them.
+run cp "${APPDIR}/usr/share/applications/${DESKTOP_FILE_NAME}" "${APPDIR}/${DESKTOP_FILE_NAME}"
+run cp "${ICON_SOURCE}" "${APPDIR}/${ICON_FILE_NAME}"
+run cp "${ICON_SOURCE}" "${APPDIR}/.DirIcon"
+
+run cp "${SCRIPT_DIR}/AppRun" "${APPDIR}/AppRun"
+run chmod +x "${APPDIR}/AppRun"
+
+# Does this freeze carry a pywebview window backend? Without PyGObject there is
+# no GTK/WebKit window and the app serves its interface over HTTP instead; the
+# marker is what tells AppRun to open a browser on a bare double-click. Writing
+# it from an actual inspection means a future build that DOES bundle gi stops
+# opening the extra tab on its own, with no second place to remember.
+if building && [ -d "${APPDIR}/usr/bin/_internal/gi" ]; then
+  log "freeze contains PyGObject - native window backend available, no browser hand-off"
+  run rm -f "${APPDIR}/usr/share/${SHARE_DIR_NAME}/browser-ui"
+else
+  log "freeze has no PyGObject - the app will serve its interface over HTTP and AppRun opens it in the default browser"
+  if building; then
+    printf '%s\n' "This build has no bundled GTK/WebKit window backend; AppRun opens the UI in the default browser." \
+      > "${APPDIR}/usr/share/${SHARE_DIR_NAME}/browser-ui"
+  fi
+fi
+
+# --- 4. appimagetool --------------------------------------------------------
+
+if [ -n "${APPIMAGETOOL:-}" ]; then
+  log "using APPIMAGETOOL=${APPIMAGETOOL}"
+else
+  APPIMAGETOOL="${APPIMAGETOOL_CACHE}"
+  if [ -f "${APPIMAGETOOL}" ]; then
+    log "appimagetool ${APPIMAGETOOL_VERSION} already downloaded"
+  else
+    log "downloading appimagetool ${APPIMAGETOOL_VERSION}"
+    run mkdir -p "$(dirname "${APPIMAGETOOL}")"
+    if command -v curl >/dev/null 2>&1; then
+      run curl -fsSL --retry 3 -o "${APPIMAGETOOL}.part" "${APPIMAGETOOL_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+      run wget -q -O "${APPIMAGETOOL}.part" "${APPIMAGETOOL_URL}"
+    else
+      die "curl or wget is required to download appimagetool"
+    fi
+    if building; then
+      echo "${APPIMAGETOOL_SHA256}  ${APPIMAGETOOL}.part" | sha256sum -c - \
+        || { rm -f "${APPIMAGETOOL}.part"; die "appimagetool digest mismatch - refusing to build with it"; }
+      mv "${APPIMAGETOOL}.part" "${APPIMAGETOOL}"
+    fi
+  fi
+  run chmod +x "${APPIMAGETOOL}"
+fi
+
+# --- 5. Build the AppImage --------------------------------------------------
+
+run mkdir -p "${OUT_DIR}"
+run rm -f "${APPIMAGE_PATH}"
+log "building the AppImage"
+# APPIMAGE_EXTRACT_AND_RUN: appimagetool is itself an AppImage and needs FUSE to
+# mount itself. CI containers and hardened hosts have no FUSE, and extracting is
+# the documented way around that - it costs a few seconds and always works.
+# --no-appstream: this project ships no AppStream metainfo file, and the check
+# is a hard error rather than a warning without one.
+if building; then
+  env APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 \
+    "${APPIMAGETOOL}" --no-appstream "${APPDIR}" "${APPIMAGE_PATH}"
+else
+  log "[dry-run] would run: APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ${APPIMAGETOOL} --no-appstream ${APPDIR} ${APPIMAGE_PATH}"
+fi
+run chmod +x "${APPIMAGE_PATH}"
+
+# --- 6. Optional Debian package --------------------------------------------
+
+DEB_PATH=""
+if [ "${BUILD_DEB}" = "0" ]; then
+  log "BUILD_DEB=0 - skipping the Debian package"
+elif ! command -v dpkg-deb >/dev/null 2>&1; then
+  log "dpkg-deb not installed - skipping the Debian package"
+else
+  VERSION="$("${PYTHON}" -c "import sys; sys.path.insert(0, '${REPO_ROOT}'); import kylo; print(kylo.__version__)")"
+  DEB_ROOT="${DIST_DIR}/deb-root"
+  # Named after the package inside it, as Debian names its files. Releases
+  # up to 4.1.2 called the file personal-jarvis_<version>_amd64.deb.
+  DEB_PATH="${OUT_DIR}/${DEB_PACKAGE_NAME}_${VERSION}_amd64.deb"
+  log "building ${DEB_PATH}"
+  run rm -rf "${DEB_ROOT}"
+  run mkdir -p "${DEB_ROOT}/DEBIAN" \
+    "${DEB_ROOT}${DEB_INSTALL_DIR}" \
+    "${DEB_ROOT}/usr/bin" \
+    "${DEB_ROOT}/usr/share/applications" \
+    "${DEB_ROOT}/usr/share/icons/hicolor/256x256/apps"
+  if building; then
+    # The very same AppDir: one tree, two package formats, so a bug can only
+    # exist in both or in neither.
+    cp -a "${APPDIR}/." "${DEB_ROOT}${DEB_INSTALL_DIR}/"
+    cat > "${DEB_ROOT}/DEBIAN/control" <<EOF
+Package: ${DEB_PACKAGE_NAME}
+Version: ${VERSION}
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libc6
+Recommends: libportaudio2
+Replaces: ${LEGACY_DEB_PACKAGE_NAME}
+Conflicts: ${LEGACY_DEB_PACKAGE_NAME}
+Provides: ${LEGACY_DEB_PACKAGE_NAME}
+Maintainer: Kylo contributors <https://github.com/charanbalaji2005/Kylo>
+Description: AI agent for your computer
+ Kylo coordinates desktop apps, tools, models and specialized
+ agents. This package ships the self-contained desktop build; it needs no
+ system Python and no pip installation.
+EOF
+    for cli_name in "${CLI_EXE_NAMES[@]}"; do
+      ln -sf "${DEB_INSTALL_DIR}/usr/bin/${cli_name}" "${DEB_ROOT}/usr/bin/${cli_name}"
+    done
+    ln -sf "${DEB_INSTALL_DIR}/AppRun" "${DEB_ROOT}/usr/bin/${LEGACY_APP_COMMAND_NAME}"
+    cp "${ICON_SOURCE}" "${DEB_ROOT}/usr/share/icons/hicolor/256x256/apps/${ICON_FILE_NAME}"
+  fi
+  run "${PYTHON}" "${SCRIPT_DIR}/make_desktop_entry.py" \
+    "${DEB_ROOT}/usr/share/applications/${DESKTOP_FILE_NAME}" \
+    --exec "${DEB_INSTALL_DIR}/AppRun" --icon "${ICON_FILE_NAME%.png}"
+  run dpkg-deb --build --root-owner-group "${DEB_ROOT}" "${DEB_PATH}"
+  run rm -rf "${DEB_ROOT}"
+fi
+
+# --- 7. Report --------------------------------------------------------------
+
+log "done"
+printf '%s\n' "${APPIMAGE_PATH}"
+if [ -n "${DEB_PATH}" ]; then
+  printf '%s\n' "${DEB_PATH}"
+fi

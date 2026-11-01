@@ -1,0 +1,1853 @@
+#!/usr/bin/env python3
+"""Bring a branch up to date with main and resolve merge conflicts on its own.
+
+This is the engine behind both halves of agent integration:
+
+* the **merge train** (``.github/workflows/merge-train.yml`` -> ``plan``,
+  ``merge``, ``resolve``, ``finish``, ``apply``) that keeps every open agent
+  pull request free of conflicts with main and hands the green ones to
+  main's merge queue, and
+* ``scripts/agent_land.py``, which a coding agent runs locally before it
+  pushes.
+
+Conflicts are resolved by file class, cheapest first:
+
+1. **Generated files** (frontend ``dist/``, the .claude / .codex copies of
+   .agents, the CLI reference docs, lockfiles, timing caches): take main's
+   copy, then REGENERATE from the merged sources. A hand-merge of generated
+   output is always wrong; a regeneration is always right. The frontend
+   bundle is the exception: a branch never carries its own build. Every
+   update puts main's ``dist/`` back (``pin_bundle``) and the Frontend bundle
+   workflow rebuilds it on main after the merge, so two frontend pull
+   requests can no longer knock each other out of the merge queue.
+2. **Append-only files** (CHANGELOG.md, allowlists, .gitignore): a union
+   merge keeps both sides' lines.
+3. **Everything else**: handed to an optional resolver command
+   (``--resolver-cmd``, e.g. ``claude -p`` or ``codex exec -``) that edits
+   the files in place. Its output must leave no conflict markers and must
+   still parse (Python compiles, JSON loads) — otherwise the update aborts.
+4. Anything still unresolved aborts cleanly and is reported, so a human or
+   the authoring agent resolves it. Nothing half-merged is ever committed.
+
+``git rerere`` is on throughout, so a resolution recorded once is replayed.
+
+A branch cut before the package directory was moved is not merged across that
+commit at all: it is updated to the commit before it, then the rename script
+is replayed on the branch's own changes (``replay_package_move``).
+
+Usage::
+
+    agent_integrate.py update --onto origin/main [--mode merge|rebase]
+    agent_integrate.py train --repo OWNER/NAME [--dry-run]   # all phases, one process
+    agent_integrate.py plan --repo OWNER/NAME --dir DIR       # the workflow's phases
+    agent_integrate.py merge|resolve|finish|apply --dir DIR
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import importlib.util
+import json
+import os
+import py_compile
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ci import merge_freeze  # noqa: E402
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+FRONTEND = "kylo/ui/web/frontend"
+
+# (glob, regenerator key). Main's copy is taken, then the key regenerates it.
+GENERATED: tuple[tuple[str, str], ...] = (
+    # No regenerator: the branch keeps main's bundle (see ``pin_bundle``).
+    ("kylo/ui/web/dist/*", ""),
+    ("docs/kylo-cli-reference.md", "reference-docs"),
+    ("docs/commands-reference.md", "reference-docs"),
+    (f"{FRONTEND}/package-lock.json", "npm-lock"),
+    ("uv.lock", "uv-lock"),
+    ("requirements.txt", "requirements"),
+    ("test_durations.json", ""),
+    ("scripts/ci/test-baseline-*.json", ""),
+)
+UNION: tuple[str, ...] = (
+    "CHANGELOG.md",
+    "scripts/ci/german-allowlist.txt",
+    ".gitignore",
+)
+# The package directory before and after its rename, and the script whose
+# output IS the commit that renames it. Until main carries the new directory
+# nothing here does anything; afterwards a branch that still has the old one
+# is carried across by ``replay_package_move`` instead of by conflicts.
+OLD_PACKAGE = "jarvis"
+NEW_PACKAGE = "kylo"
+RENAME_SCRIPT = "scripts/rename/rewrite_package.py"
+BUNDLE_DIR = "kylo/ui/web/dist"
+# The retired Frontend bundle workflow's branch. main tracks no bundle (release
+# tags carry their own build), so pin_bundle drops it there too.
+BUNDLE_BOT_BRANCH = "bot/frontend-bundle"
+AGENT_BRANCH_PREFIXES = ("codex/", "claude/", "agent/", "agents/", "gemini/", "cursor/", "bot/")
+OPT_OUT_LABELS = {"no-auto-merge", "do-not-merge", "wip", "needs-human"}
+OPT_IN_LABEL = "auto-merge"
+
+
+def git(*args: str, check: bool = True, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        ["git", "-c", "rerere.enabled=true", "-c", "rerere.autoupdate=true", *args],  # noqa: S607
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=check,
+    )
+
+
+def _sh(
+    cmd: list[str],
+    *,
+    cwd: Path = REPO_ROOT,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    print(f"[integrate] $ {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(  # noqa: S603
+        cmd,
+        cwd=cwd,
+        env=env,
+        input=stdin,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    return proc.returncode
+
+
+def classify(path: str) -> tuple[str, str]:
+    """Return (strategy, regenerator) for a conflicted path."""
+    for pattern, regen in GENERATED:
+        if fnmatch.fnmatch(path, pattern):
+            return "generated", regen
+    if path in UNION:
+        return "union", ""
+    return "semantic", ""
+
+
+def conflicted_files(cwd: Path = REPO_ROOT) -> list[str]:
+    out = git("diff", "--name-only", "--diff-filter=U", cwd=cwd).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def has_markers(path: Path) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return text.startswith("<<<<<<< ") or any(m in text for m in ("\n<<<<<<< ", "\n>>>>>>> "))
+
+
+def still_valid(path: Path) -> str | None:
+    """Return an error when a resolved file no longer parses."""
+    if not path.exists():
+        return None
+    if has_markers(path):
+        return "conflict markers remain"
+    if path.suffix == ".py":
+        try:
+            py_compile.compile(str(path), doraise=True)
+        except py_compile.PyCompileError as exc:
+            return f"does not compile: {exc.msg.strip()[:200]}"
+    if path.suffix == ".json":
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            return f"invalid JSON: {exc}"
+    return None
+
+
+def _stage_blob(stage: int, path: str, cwd: Path) -> str | None:
+    result = git("show", f":{stage}:{path}", check=False, cwd=cwd)
+    return result.stdout if result.returncode == 0 else None
+
+
+def union_merge(path: str, cwd: Path) -> bool:
+    base = _stage_blob(1, path, cwd) or ""
+    ours = _stage_blob(2, path, cwd)
+    theirs = _stage_blob(3, path, cwd)
+    if ours is None or theirs is None:
+        return False
+    tmp = cwd / ".git-union-tmp"
+    tmp.mkdir(exist_ok=True)
+    try:
+        files = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            target = tmp / name
+            target.write_text(text, encoding="utf-8", newline="")
+            files.append(str(target))
+        proc = subprocess.run(  # noqa: S603
+            ["git", "merge-file", "--union", "-p", *files],  # noqa: S607
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            cwd=cwd,
+        )
+        (cwd / path).write_text(proc.stdout, encoding="utf-8", newline="")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    git("add", "--", path, cwd=cwd)
+    return True
+
+
+def take_side(path: str, side: str, cwd: Path) -> None:
+    """Check out one side of a conflict; a side that deleted the file deletes it."""
+    result = git("checkout", f"--{side}", "--", path, check=False, cwd=cwd)
+    if result.returncode != 0:
+        git("rm", "-q", "--cached", "--ignore-unmatch", "--", path, check=False, cwd=cwd)
+        (cwd / path).unlink(missing_ok=True)
+        return
+    git("add", "--", path, cwd=cwd)
+
+
+def pin_bundle(onto: str, cwd: Path, branch: str = "") -> bool:
+    """Give HEAD the frontend bundle of ``onto`` and commit that if it changes
+    anything. Returns whether a commit was made.
+
+    main tracks no bundle (release tags carry one built from their own
+    sources), so this drops any copy a branch still carries, for example one
+    cut before main stopped tracking it. A branch that carries its own build
+    would conflict with every other frontend pull request. No branch is
+    exempt, the retired rebuild bot's included: its pull request must never
+    bring the bundle back. ``branch`` is kept for the callers' signature.
+    """
+    del branch
+    if not git("diff", "--quiet", onto, "HEAD", "--", BUNDLE_DIR, check=False, cwd=cwd).returncode:
+        return False
+    if not _in_tree("HEAD", BUNDLE_DIR, cwd):
+        # This branch has no bundle at all: it is the one that stops main
+        # tracking it, or it was cut after that. Never put main's copy back.
+        return False
+    git("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", BUNDLE_DIR, cwd=cwd)
+    if _in_tree(onto, BUNDLE_DIR, cwd):
+        git("checkout", onto, "--", BUNDLE_DIR, cwd=cwd)
+    commit = git(
+        "commit",
+        "-q",
+        "-m",
+        "chore: drop the frontend bundle, main does not track it",
+        check=False,
+        cwd=cwd,
+    )
+    return commit.returncode == 0
+
+
+def regenerate(keys: set[str], cwd: Path) -> list[str]:
+    """Run the regenerators; return the ones that failed."""
+    failures: list[str] = []
+    py = sys.executable
+    commands: dict[str, list[list[str]]] = {
+        "reference-docs": [
+            [py, "scripts/ci/gen_cli_reference.py"],
+            [py, "scripts/ci/gen_commands_reference.py"],
+        ],
+        "uv-lock": [["uv", "lock"]],
+        "requirements": [
+            [
+                "uv",
+                "pip",
+                "compile",
+                "--universal",
+                "--generate-hashes",
+                "--python-version",
+                "3.11",
+                "--output-file=requirements.txt",
+                "requirements.in",
+            ]
+        ],
+    }
+    npm = shutil.which("npm") or "npm"
+    commands["npm-lock"] = [[npm, "install", "--package-lock-only", "--ignore-scripts"]]
+    commands["frontend-build"] = [[npm, "ci"], [npm, "run", "build"]]
+    order = ["npm-lock", "uv-lock", "requirements", "reference-docs", "frontend-build"]
+    # The merge train regenerates inside a separate worktree per pull request
+    # while the editable install points at the main checkout; putting the
+    # worktree first on PYTHONPATH makes `import kylo` read the merged code.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(cwd), os.environ.get("PYTHONPATH", "")) if p
+    )
+    for key in order:
+        if key not in keys:
+            continue
+        workdir = cwd / FRONTEND if key in {"npm-lock", "frontend-build"} else cwd
+        tool = commands[key][0][0]
+        if shutil.which(tool) is None and not Path(tool).exists():
+            print(f"[integrate] regenerator {key}: {tool} not installed", flush=True)
+            failures.append(key)
+            continue
+        for cmd in commands[key]:
+            if _sh(cmd, cwd=workdir, env=env) != 0:
+                failures.append(key)
+                break
+    return failures
+
+
+@dataclass
+class Resolution:
+    resolved: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+    regenerate: set[str] = field(default_factory=set)
+    ai_resolved: list[str] = field(default_factory=list)
+
+
+def resolve_conflicts(main_side: str, resolver_cmd: str, cwd: Path) -> Resolution:
+    """Resolve the current index conflicts. ``main_side`` is ours|theirs."""
+    res = Resolution()
+    semantic: list[str] = []
+    for path in conflicted_files(cwd):
+        strategy, regen = classify(path)
+        if strategy == "generated":
+            take_side(path, main_side, cwd)
+            if regen:
+                res.regenerate.add(regen)
+            res.resolved.append(path)
+        elif strategy == "union" and union_merge(path, cwd):
+            res.resolved.append(path)
+        else:
+            semantic.append(path)
+    # rerere may already have replayed a recorded resolution: both sides still
+    # exist and the markers are gone. A modify/delete conflict also has no
+    # markers, but one side is missing — that one stays unresolved.
+    for path in list(semantic):
+        both_sides = _stage_blob(2, path, cwd) is not None and _stage_blob(3, path, cwd) is not None
+        if both_sides and (cwd / path).exists() and still_valid(cwd / path) is None:
+            git("add", "--", path, cwd=cwd)
+            semantic.remove(path)
+            res.resolved.append(path)
+    if semantic and resolver_cmd:
+        prompt = build_prompt(semantic, main_side)
+        _sh([*shlex.split(resolver_cmd)], cwd=cwd, stdin=prompt)
+        for path in list(semantic):
+            error = still_valid(cwd / path)
+            if error is None:
+                git("add", "--", path, cwd=cwd)
+                semantic.remove(path)
+                res.resolved.append(path)
+                res.ai_resolved.append(path)
+            else:
+                print(f"[integrate] resolver left {path} broken: {error}", flush=True)
+    res.unresolved = semantic
+    return res
+
+
+def build_prompt(paths: list[str], main_side: str) -> str:
+    branch_side = "theirs" if main_side == "ours" else "ours"
+    listing = "\n".join(f"- {p}" for p in paths)
+    return (
+        "You are resolving git merge conflicts in the Kylo repository. "
+        "The files below contain conflict markers. For each file, edit it in place so "
+        "that it keeps the intent of BOTH sides: the main branch "
+        f"(git side '{main_side}') is the latest shared state; the feature branch "
+        f"(git side '{branch_side}') carries new work that must survive on top of it. "
+        "Remove every conflict marker. Do not touch any other file, do not run git, "
+        "do not commit. If a conflict cannot be resolved safely, leave its markers in "
+        "place — an unresolved file is reported to a human, a wrong guess is not.\n\n"
+        f"Files:\n{listing}\n"
+    )
+
+
+def _in_progress(cwd: Path) -> str | None:
+    git_dir = Path(git("rev-parse", "--git-dir", cwd=cwd).stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = cwd / git_dir
+    if (git_dir / "MERGE_HEAD").exists():
+        return "merge"
+    if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        return "rebase"
+    return None
+
+
+def _in_tree(rev: str, path: str, cwd: Path) -> bool:
+    return git("cat-file", "-e", f"{rev}:{path}", check=False, cwd=cwd).returncode == 0
+
+
+def _move_commit(onto: str, cwd: Path) -> str:
+    """The commit on ``onto``'s first-parent line that added the new directory."""
+    found = git(
+        "log", "-1", "--first-parent", "-m", "--diff-filter=A", "--format=%H", onto,
+        "--", f"{NEW_PACKAGE}/__init__.py",
+        check=False, cwd=cwd,
+    )  # fmt: skip
+    return found.stdout.strip()
+
+
+def carried_package_move(onto: str, cwd: Path = REPO_ROOT) -> str | None:
+    """The move commit when HEAD was carried across the package move by an
+    earlier update: it has the new layout and still holds commits of its own
+    from the old one, below the merge that replayed the move. A rebase would
+    drop that merge and replay those commits onto the new layout, a conflict
+    in every file they touch, so such a branch is updated by merge from then
+    on. ``None`` in every other case - which is every case until main has the
+    new directory."""
+    new_init = f"{NEW_PACKAGE}/__init__.py"
+    if not _in_tree(onto, new_init, cwd) or not _in_tree("HEAD", new_init, cwd):
+        return None
+    own = git("rev-list", "--no-merges", "--topo-order", f"{onto}..HEAD", check=False, cwd=cwd)
+    # Oldest first: a commit from before the move is the first one asked.
+    if all(_in_tree(commit, new_init, cwd) for commit in reversed(own.stdout.split())):
+        return None
+    return _move_commit(onto, cwd) or None
+
+
+def package_move(onto: str, cwd: Path = REPO_ROOT) -> tuple[str, str] | None:
+    """``(last commit before the move, the move commit)`` when ``onto`` has
+    renamed the package directory and HEAD has not; ``None`` in every other
+    case - which is every case until that rename lands on main."""
+    new_init = f"{NEW_PACKAGE}/__init__.py"
+    if not _in_tree(onto, new_init, cwd) or _in_tree("HEAD", new_init, cwd):
+        return None
+    if not _in_tree("HEAD", f"{OLD_PACKAGE}/__init__.py", cwd):
+        return None
+    move = _move_commit(onto, cwd)
+    if not move or not _in_tree(move, RENAME_SCRIPT, cwd):
+        return None  # renamed by hand: nothing to replay, the ordinary update applies
+    parent = git("rev-parse", "--verify", "--quiet", f"{move}^", check=False, cwd=cwd)
+    before = parent.stdout.strip()
+    if not before or _in_tree(before, new_init, cwd):
+        return None
+    return before, move
+
+
+def _git_bytes(
+    *args: str, cwd: Path, stdin: bytes | None = None, env: dict[str, str] | None = None
+) -> bytes:
+    return subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607
+        cwd=cwd,
+        input=stdin,
+        env=env,
+        capture_output=True,
+        check=True,
+        creationflags=_NO_WINDOW,
+    ).stdout
+
+
+def _load_rename_script(move: str, cwd: Path):  # noqa: ANN202
+    """The rename script exactly as the move commit ran it. It is main's code
+    and treats the branch's files as text; it never executes them."""
+    source = _git_bytes("show", f"{move}:{RENAME_SCRIPT}", cwd=cwd)
+    with tempfile.TemporaryDirectory(prefix="package-rename-") as tmp:
+        path = Path(tmp) / "package_rename_at_move.py"
+        path.write_bytes(source)
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        if spec is None or spec.loader is None:
+            raise OSError(f"cannot load {RENAME_SCRIPT} from {move}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module  # dataclasses look their module up by name
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop(spec.name, None)
+    return module
+
+
+def replay_package_move(before: str, move: str, cwd: Path = REPO_ROOT) -> str:
+    """Carry HEAD across the package rename; returns the new commit.
+
+    HEAD must contain ``before``. The move commit is the rename script's
+    output on ``before``, so the same script applied to the files THIS branch
+    changed is the branch's side of the merge, and every other file is the
+    move commit's own. That tree is committed as the merge of HEAD with the
+    move commit: no file is merged by hand and none can conflict.
+    """
+    rewriter = _load_rename_script(move, cwd).Rewriter.from_tree(cwd, OLD_PACKAGE, NEW_PACKAGE)
+    listing = _git_bytes("ls-tree", "-r", "-z", "HEAD", cwd=cwd).decode("utf-8", "surrogateescape")
+    entries: dict[str, tuple[str, str]] = {}
+    for record in listing.split("\0"):
+        if record:
+            meta, _, path = record.partition("\t")
+            mode, _kind, sha = meta.split(" ")
+            entries[path] = (mode, sha)
+    changed = _git_bytes("diff", "--name-only", "--no-renames", "-z", before, "HEAD", cwd=cwd)
+    index_info: list[str] = []
+    for path in changed.decode("utf-8", "surrogateescape").split("\0"):
+        if not path:
+            continue
+        target = rewriter.map_path(path)
+        if path not in entries:  # the branch deleted it
+            index_info.append(f"0 {'0' * 40}\t{target}")
+            continue
+        mode, sha = entries[path]
+        if mode in ("100644", "100755"):
+            data = _git_bytes("cat-file", "blob", sha, cwd=cwd)
+            rewritten = rewriter.transform(path, data)
+            if rewritten != data:
+                sha = _git_bytes(
+                    "hash-object", "-w", "--stdin", cwd=cwd, stdin=rewritten
+                ).decode().strip()  # fmt: skip
+        index_info.append(f"{mode} {sha}\t{target}")
+    with tempfile.TemporaryDirectory(prefix="package-rename-") as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        _git_bytes("read-tree", move, cwd=cwd, env=env)
+        _git_bytes(
+            "update-index", "-z", "--index-info", cwd=cwd, env=env,
+            stdin="".join(f"{line}\0" for line in index_info).encode("utf-8", "surrogateescape"),
+        )  # fmt: skip
+        tree = _git_bytes("write-tree", cwd=cwd, env=env).decode().strip()
+    message = f"Merge the {OLD_PACKAGE} -> {NEW_PACKAGE} package move"
+    commit = git("commit-tree", tree, "-p", "HEAD", "-p", move, "-m", message, cwd=cwd).stdout
+    git("merge", "--ff-only", commit.strip(), cwd=cwd)
+    return commit.strip()
+
+
+def update(onto: str, mode: str, resolver_cmd: str, cwd: Path = REPO_ROOT) -> dict[str, object]:
+    """Update HEAD with ``onto``. Returns a JSON-able report; ``status`` is
+    ``up-to-date`` | ``updated`` | ``conflict``."""
+    if git("merge-base", "--is-ancestor", onto, "HEAD", check=False, cwd=cwd).returncode == 0:
+        if pin_bundle(onto, cwd):
+            return {"status": "updated", "bundle": "kept main's"}
+        return {"status": "up-to-date"}
+    report: dict[str, object] = {"status": "updated", "resolved": [], "ai_resolved": []}
+    regen: set[str] = set()
+    resolved: list[str] = []
+    ai: list[str] = []
+    moved = package_move(onto, cwd)
+    carried = ""
+    if moved:
+        before, move = moved
+        # Everything up to the move is an ordinary update between two trees of
+        # the same layout; the move itself is replayed, never merged.
+        first = update(before, mode, resolver_cmd, cwd)
+        if first["status"] == "conflict":
+            return {**first, "onto": before}
+        resolved += first.get("resolved", [])  # type: ignore[arg-type]
+        ai += first.get("ai_resolved", [])  # type: ignore[arg-type]
+        replay_package_move(before, move, cwd)
+        carried = move
+    elif mode == "rebase":
+        carried = carried_package_move(onto, cwd) or ""
+    if carried:
+        report["package_move"] = carried
+        mode = "merge"  # a rebase would drop the merge that carries the move
+    if mode == "merge":
+        result = git("merge", "--no-edit", "--no-ff", onto, check=False, cwd=cwd)
+        if result.returncode != 0:
+            res = resolve_conflicts("theirs", resolver_cmd, cwd)
+            resolved += res.resolved
+            ai += res.ai_resolved
+            regen |= res.regenerate
+            if res.unresolved or conflicted_files(cwd):
+                left = res.unresolved or conflicted_files(cwd)
+                git("merge", "--abort", check=False, cwd=cwd)
+                # A replayed move stays: the branch is whole in the new layout.
+                across = {"package_move": carried} if carried else {}
+                return {"status": "conflict", "unresolved": left, **across}
+            git("commit", "--no-edit", check=False, cwd=cwd)
+    else:
+        git("rebase", onto, check=False, cwd=cwd)
+        guard = 0
+        while _in_progress(cwd) == "rebase":
+            guard += 1
+            res = resolve_conflicts("ours", resolver_cmd, cwd)
+            resolved += res.resolved
+            ai += res.ai_resolved
+            regen |= res.regenerate
+            if res.unresolved or conflicted_files(cwd) or guard > 200:
+                git("rebase", "--abort", check=False, cwd=cwd)
+                return {"status": "conflict", "unresolved": res.unresolved or conflicted_files(cwd)}
+            env_result = subprocess.run(  # noqa: S603
+                ["git", "-c", "core.editor=true", "rebase", "--continue"],  # noqa: S607
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if env_result.returncode != 0 and not conflicted_files(cwd):
+                # An emptied commit: its change already landed on main.
+                git("rebase", "--skip", check=False, cwd=cwd)
+    if regen:
+        outcome = regenerate_and_commit(regen, cwd)
+        if outcome is None:
+            return {"status": "conflict", "unresolved": ["<regenerated files rejected>"]}
+        report.update(outcome)
+    if pin_bundle(onto, cwd):
+        report["bundle"] = "kept main's"
+    report["resolved"] = sorted(set(resolved))
+    report["ai_resolved"] = sorted(set(ai))
+    return report
+
+
+def regenerate_and_commit(regen: set[str], cwd: Path) -> dict[str, object] | None:
+    """Regenerate generated files and commit them. ``None`` when the commit
+    was rejected; otherwise the ``regenerated`` / ``regen_failed`` report."""
+    failed = regenerate(regen, cwd)
+    # One missing pathspec makes `git add` stage NOTHING, so pass only the
+    # generated paths that exist — a half-staged frontend bundle is the
+    # exact breakage the dist-consistency gate exists for.
+    specs = {p.rstrip("*").rstrip("/") for p, _ in GENERATED}
+    existing = sorted(s for s in specs if (cwd / s).exists())
+    if existing:
+        git("add", "-A", "--", *existing, cwd=cwd)
+    if "frontend-build" in regen and "frontend-build" not in failed:
+        # The build keeps retired chunks on disk for open windows, and a
+        # fresh clone restarts that grace period, so `add -A` just staged
+        # every earlier build's chunks too. Untrack them; disk is untouched.
+        _sh(
+            [sys.executable, "scripts/ci/check_dist_consistency.py", "--staged", "--prune"],
+            cwd=cwd,
+        )
+    staged = git("diff", "--cached", "--name-only", cwd=cwd).stdout.strip()
+    if staged:
+        commit = git(
+            "commit",
+            "-m",
+            "chore: regenerate generated files after update",
+            check=False,
+            cwd=cwd,
+        )
+        if commit.returncode != 0:
+            print(commit.stdout[-3000:] + commit.stderr[-3000:], flush=True)
+            return None
+    report: dict[str, object] = {"regenerated": sorted(regen - set(failed))}
+    if failed:
+        report["regen_failed"] = failed
+    return report
+
+
+# --------------------------------------------------------------------------- merge train
+#
+# The train runs as three jobs with three trust levels (merge-train.yml):
+#
+#   plan       read-only token, no secrets, runs no pull-request code: one
+#              decision per eligible pull request (``plan``).
+#   integrate  read-only token: merges main into the branches that need it,
+#              one worktree each (``merge``); lets the optional AI resolver
+#              edit the conflicts left over (``resolve`` - the only step that
+#              holds API keys, and nothing from a pull request has executed
+#              on that machine yet); then regenerates generated files, which
+#              runs pull-request code, and bundles the result (``finish``).
+#   apply      write token, runs no pull-request code: pushes the bundles,
+#              labels and comments, approves parked CI runs, and lands green
+#              pull requests - through main's merge queue when it has one,
+#              directly otherwise (``apply``).
+#
+# ``train`` runs every phase in one process, for a local or manual run.
+
+QUEUE_HEAD_PREFIX = "gh-readonly-queue/main/pr-"
+_QUEUE_QUERY = (
+    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+    'mergeQueue(branch:"main"){entries(first:100){nodes{pullRequest{number}}}}}}'
+)
+_ENQUEUE = (
+    "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest("
+    "input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{position}}}"
+)
+
+
+def gh_json(*args: str) -> object:
+    out = subprocess.run(  # noqa: S603
+        ["gh", *args],  # noqa: S607
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout
+    return json.loads(out or "null")
+
+
+def gh(*args: str) -> int:
+    print(f"[train] $ gh {' '.join(args)}", flush=True)
+    return subprocess.run(["gh", *args], check=False).returncode  # noqa: S603, S607
+
+
+def eligible(pr: dict) -> bool:
+    labels = {label["name"] for label in pr.get("labels", [])}
+    if pr.get("isDraft") or pr.get("baseRefName") != "main" or labels & OPT_OUT_LABELS:
+        return False
+    if pr.get("isCrossRepository"):
+        return False  # a fork's code never runs with this workflow's write token
+    return OPT_IN_LABEL in labels or pr.get("headRefName", "").startswith(AGENT_BRANCH_PREFIXES)
+
+
+_ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
+_QUEUE_FAILED = {"failure", "timed_out", "startup_failure"}
+
+
+def run_state(runs: list[dict]) -> tuple[str, int | None]:
+    """(state, run id) for a pull request's head commit, from its ci.yml runs.
+
+    Only ``pull_request`` runs count: GitHub attaches the `CI gate` check of a
+    workflow_dispatch run to the commit but NOT to the pull request, so branch
+    protection never sees it. A pull_request run triggered by the train's own
+    GITHUB_TOKEN push parks in ``action_required``; the train approves it.
+
+    Read from the workflow RUNS, not the `CI gate` check: the gate is the last
+    job, so a running CI has no gate check yet.
+
+    States: pending | success | failure | approve | rerun | missing.
+    """
+    pr_runs = [r for r in runs if r.get("event") == "pull_request"]
+    if any(r.get("status") in _ACTIVE for r in pr_runs):
+        return "pending", None
+    if not pr_runs:
+        return "missing", None
+    latest = max(pr_runs, key=lambda r: r.get("created_at") or "")
+    conclusion = latest.get("conclusion")
+    run_id = latest.get("id")
+    if conclusion == "success":
+        return "success", run_id
+    if conclusion == "action_required":
+        return "approve", run_id
+    if conclusion in ("cancelled", "stale", "skipped", "neutral", None):
+        return "rerun", run_id
+    return "failure", run_id
+
+
+def gate_runs(repo: str, sha: str) -> list[dict]:
+    data = gh_json("api", f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={sha}&per_page=50")
+    return (data or {}).get("workflow_runs", []) if isinstance(data, dict) else []
+
+
+def gate_state(repo: str, sha: str) -> tuple[str, int | None]:
+    return run_state(gate_runs(repo, sha))
+
+
+def merge_queue_numbers(repo: str) -> set[int] | None:
+    """Pull requests in main's merge queue; ``None`` when main has no queue."""
+    owner, name = repo.split("/", 1)
+    data = gh_json(
+        "api",
+        "graphql",
+        "-f",
+        f"query={_QUEUE_QUERY}",
+        "-f",
+        f"owner={owner}",
+        "-f",
+        f"name={name}",
+    )
+    repository = ((data or {}).get("data") or {}).get("repository") or {}  # type: ignore[union-attr]
+    queue = repository.get("mergeQueue")
+    if queue is None:
+        return None
+    nodes = (queue.get("entries") or {}).get("nodes") or []
+    return {n["pullRequest"]["number"] for n in nodes if n and n.get("pullRequest")}
+
+
+def queue_group_runs(repo: str) -> list[dict]:
+    data = gh_json(
+        "api", f"repos/{repo}/actions/workflows/ci.yml/runs?event=merge_group&per_page=100"
+    )
+    return (data or {}).get("workflow_runs", []) if isinstance(data, dict) else []
+
+
+def queue_runs_by_pr(runs: list[dict]) -> dict[int, dict]:
+    """The newest merge-queue CI run per pull request number.
+
+    A queue entry's temporary branch is ``gh-readonly-queue/main/pr-<N>-<base>``.
+    """
+    newest: dict[int, dict] = {}
+    for run in runs:
+        branch = run.get("head_branch") or ""
+        if run.get("event") != "merge_group" or not branch.startswith(QUEUE_HEAD_PREFIX):
+            continue
+        number = branch[len(QUEUE_HEAD_PREFIX) :].split("-", 1)[0]
+        if not number.isdigit():
+            continue
+        key = int(number)
+        if key not in newest or (run.get("created_at") or "") > (
+            newest[key].get("created_at") or ""
+        ):
+            newest[key] = run
+    return newest
+
+
+def queue_rejected(queue_run: dict | None, runs: list[dict]) -> bool:
+    """True when the merge queue already failed this head after its PR run went green.
+
+    Re-adding it unchanged would fail the same way and stall every entry behind
+    it; a new push (or the train's own update with main) produces a newer green
+    pull_request run and lifts the hold. A cancelled queue run is the queue
+    rebuilding a group, not a verdict.
+    """
+    if not queue_run or queue_run.get("status") != "completed":
+        return False
+    if queue_run.get("conclusion") not in _QUEUE_FAILED:
+        return False
+    green = [
+        r.get("created_at") or ""
+        for r in runs
+        if r.get("event") == "pull_request" and r.get("conclusion") == "success"
+    ]
+    return (queue_run.get("created_at") or "") > max(green, default="")
+
+
+def decide(
+    mergeable: str,
+    state: str,
+    behind: bool,
+    *,
+    queued: bool = False,
+    queue_failed: bool = False,
+) -> str:
+    """The train's action for one pull request.
+
+    A branch is NOT brought up to date just because main moved — with several
+    agents pushing to main, that re-ran every PR's CI on every push and
+    nothing ever landed. The merge queue tests each PR on top of the newest
+    main before it lands, so a merely-behind branch is safe to hand over.
+    A branch is updated only when it CONFLICTS with main, or when a red
+    verdict (its own CI, or the queue's) came while it was behind, since a
+    newer main may be the fix.
+
+    Actions: update | merge (enqueue, or merge directly without a queue) |
+    approve | rerun | queued | held | wait.
+    """
+    if queued:
+        return "queued"  # the queue owns it now; it drops the PR itself on a conflict
+    if mergeable == "CONFLICTING":
+        return "update"
+    if state in ("approve", "rerun"):
+        return state  # getting CI to run never depends on mergeability
+    if mergeable not in ("MERGEABLE", ""):
+        return "wait"  # GitHub is still computing mergeability
+    if state == "success":
+        if queue_failed:
+            return "update" if behind else "held"
+        return "merge"
+    if state == "failure" and behind:
+        return "update"
+    return "wait"
+
+
+def grant_updates(wanted: list[dict[str, object]], max_updates: int) -> set[int]:
+    """Which pull requests get this tick's update slots.
+
+    The slots used to go to the lowest numbers. A pull request the train
+    cannot update (an unresolved conflict, labelled ``needs-rebase``) and one
+    whose own CI is red both ask again on every tick: three of them held all
+    three slots for days while green pull requests that merely conflicted
+    with main waited behind them. First come ``priority``, then the ones the
+    train has not already failed on, then green CI, then the number.
+    """
+
+    def rank(entry: dict[str, object]) -> tuple[bool, bool, bool, int]:
+        labels = {str(label) for label in entry.get("labels") or ()}  # type: ignore[attr-defined]
+        return (
+            "priority" not in labels,
+            "needs-rebase" in labels,
+            entry.get("state") != "success",
+            int(str(entry["number"])),
+        )
+
+    chosen = sorted(wanted, key=rank)[: max(0, max_updates)]
+    return {int(str(entry["number"])) for entry in chosen}
+
+
+# ----- watchdog: pull requests whose agent stopped before they landed
+#
+# A coding agent's session can end before its pull request lands. Each tick
+# the train looks for the ones that stopped moving, and says so once:
+#
+# * stuck   - green CI but neither queued nor set to auto-merge for
+#             GREEN_IDLE_MINUTES; red CI and no new commit for
+#             RED_IDLE_MINUTES; or a conflict the train could not resolve.
+#             The label goes again as soon as the pull request moves.
+# * stale   - no commit for STALE_DAYS (drafts too); closed after CLOSE_DAYS
+#             unless labelled `keep`.
+# * a merge freeze (scripts/ci/merge_freeze.py) holds every other pull
+#   request out of the queue; an expired one is pointed out once.
+
+STUCK_LABEL = "stuck"
+STALE_LABEL = "stale"
+KEEP_LABEL = "keep"
+GREEN_IDLE_MINUTES = 30.0
+RED_IDLE_MINUTES = 60.0
+STALE_DAYS = 7.0
+CLOSE_DAYS = 14.0
+# The integrate job commits as this author; its merges of main are not the
+# pull request's own activity.
+TRAIN_AUTHOR = "jarvis-merge-train[bot]"
+STALE_EXEMPT = {KEEP_LABEL, "needs-human", merge_freeze.FREEZE_LABEL, *OPT_OUT_LABELS}
+DEPENDABOT_LOGINS = {"dependabot", "dependabot[bot]", "app/dependabot"}
+TRAIN_LABELS: dict[str, tuple[str, str]] = {
+    STUCK_LABEL: ("d93f0b", "The merge train found this pull request not moving"),
+    STALE_LABEL: ("cfd3d7", "No commit for 7 days; the merge train closes it after 14"),
+    KEEP_LABEL: ("0e8a16", "Never closed as stale by the merge train"),
+    merge_freeze.FREEZE_LABEL: ("b60205", "Holds main still for this pull request (2 h at most)"),
+}
+STALE_WARNING = "No activity for 7 days; this closes in 7 more days unless labelled `keep`."
+STALE_MARKER = "<!-- merge-train:stale-warning -->"
+STALE_CLOSING = (
+    "No activity for 14 days, so the merge train closes this pull request. "
+    "Reopen it and push a commit to continue, or label it `keep` before reopening."
+)
+FREEZE_EXPIRED = (
+    "This merge freeze is older than 2 h and no longer holds main. "
+    "Remove the `merge-freeze` label when done, or re-add it to renew."
+)
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _try_json(*args: str) -> object:
+    """``gh_json`` that answers ``None`` instead of raising: the watchdog
+    never stops the train."""
+    try:
+        return gh_json(*args)
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return None
+
+
+def _age(stamp: str | None, now: datetime, unit: float) -> float | None:
+    """Age of an ISO time stamp in ``unit`` seconds; ``None`` when unknown."""
+    when = merge_freeze.parse_time(stamp)
+    return None if when is None else (now - when).total_seconds() / unit
+
+
+def run_finished_at(runs: list[dict]) -> str | None:
+    """When the newest ``pull_request`` CI run of a head finished, or ``None``
+    while it runs (the same run ``run_state`` reads its verdict from)."""
+    pr_runs = [r for r in runs if r.get("event") == "pull_request"]
+    if not pr_runs or any(r.get("status") in _ACTIVE for r in pr_runs):
+        return None
+    latest = max(pr_runs, key=lambda r: r.get("created_at") or "")
+    return latest.get("updated_at") if latest.get("status") == "completed" else None
+
+
+def failing_jobs(repo: str, run_id: int | None, limit: int = 5) -> list[str]:
+    """Names of the failed jobs of a CI run (the first ``limit``)."""
+    if not run_id:
+        return []
+    data = _try_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100")
+    jobs = data.get("jobs", []) if isinstance(data, dict) else []
+    names = [
+        str(job.get("name"))
+        for job in jobs
+        if isinstance(job, dict) and job.get("conclusion") in ("failure", "timed_out")
+    ]
+    # The `CI gate` job only repeats that another one failed.
+    names = [name for name in names if name != "CI gate"] or names
+    return names[:limit] + (["..."] if len(names) > limit else [])
+
+
+def watch_verdict(
+    *,
+    number: int,
+    action: str,
+    state: str,
+    merge_state: str,
+    labels: set[str] | list[str],
+    auto_merge: bool,
+    idle_minutes: float | None,
+    frozen: bool = False,
+    failing: list[str] | None = None,
+) -> dict[str, object] | None:
+    """Why one eligible pull request is stuck, and the one next step; ``None``
+    while it moves. ``idle_minutes``: since its head's CI run finished."""
+    if action == "queued" or auto_merge:
+        return None  # GitHub lands it on its own
+    if merge_state == "DIRTY" and "needs-rebase" in labels:
+        # The train already said so with `needs-rebase`; only the label is added.
+        return {
+            "reason": "conflict",
+            "why": "it conflicts with `main` and the merge train could not resolve it",
+            "step": "Merge `main` into this branch and resolve the conflicts: "
+            "`python scripts/agent_land.py --pr`.",
+            "comment": False,
+        }
+    if idle_minutes is None:
+        return None
+    if (
+        state == "success"
+        and merge_state != "DIRTY"
+        and not frozen
+        and idle_minutes >= GREEN_IDLE_MINUTES
+    ):
+        if action == "held":
+            step = (
+                "Push a fix for what failed in the merge queue (or re-add the pull "
+                "request to the queue by hand if it was a flake)."
+            )
+        else:
+            step = f"Request auto-merge: `gh pr merge {number} --auto --squash`."
+        return {
+            "reason": "green-idle",
+            "why": f"its CI has been green for {idle_minutes:.0f} min, but it is neither "
+            "in the merge queue nor set to auto-merge",
+            "step": step,
+            "comment": True,
+        }
+    if state == "failure" and idle_minutes >= RED_IDLE_MINUTES:
+        names = ", ".join(f"`{name}`" for name in failing or [])
+        return {
+            "reason": "red-idle",
+            "why": f"its CI has been red for {idle_minutes:.0f} min with no new commit",
+            "step": f"Fix the failing checks: {names}." if names else "Fix the failing checks.",
+            "comment": True,
+        }
+    return None
+
+
+def stuck_marker(head: str) -> str:
+    return f"<!-- merge-train:stuck:{head} -->"
+
+
+def freeze_marker(freeze: merge_freeze.Freeze) -> str:
+    since = freeze.since.isoformat() if freeze.since else "unknown"
+    return f"<!-- merge-train:freeze-expired:{since} -->"
+
+
+def already_told(repo: str, number: int, marker: str) -> bool:
+    """Whether a train comment carrying ``marker`` is on the pull request.
+    Unknown counts as told: a missed note is cheaper than a repeated one."""
+    data = _try_json("pr", "view", str(number), "--repo", repo, "--json", "comments")
+    if not isinstance(data, dict):
+        return True
+    return any(marker in str(c.get("body") or "") for c in data.get("comments") or [])
+
+
+def _author(pr: dict) -> str:
+    author = pr.get("author") or {}
+    return str(author.get("login") or "") if isinstance(author, dict) else ""
+
+
+def stale_candidate(pr: dict) -> bool:
+    """A pull request the abandoned-PR sweep may look at: an eligible one,
+    drafts included, never Dependabot's."""
+    branch = pr.get("headRefName") or ""
+    if _author(pr) in DEPENDABOT_LOGINS or branch.startswith("dependabot/"):
+        return False
+    if pr.get("baseRefName") != "main" or pr.get("isCrossRepository"):
+        return False
+    labels = {label["name"] for label in pr.get("labels", [])}
+    # The opt-out labels are checked by ``stale_verdict``, which also lifts
+    # `stale` again when one of them is added.
+    return OPT_IN_LABEL in labels or branch.startswith(AGENT_BRANCH_PREFIXES)
+
+
+def stale_verdict(labels: set[str], idle_days: float, labelled_days: float | None) -> str | None:
+    """warn | close | unstale | None for one candidate.
+
+    ``idle_days``: since its last own commit. ``labelled_days``: since the
+    ``stale`` label went on (``None`` when unknown - then it is never closed,
+    so a pull request is always warned a full week before it closes)."""
+    if labels & STALE_EXEMPT or idle_days < STALE_DAYS:
+        return "unstale" if STALE_LABEL in labels else None
+    if STALE_LABEL not in labels:
+        return "warn"
+    if (
+        idle_days >= CLOSE_DAYS
+        and labelled_days is not None
+        and labelled_days >= CLOSE_DAYS - STALE_DAYS
+    ):
+        return "close"
+    return None
+
+
+_ACTIVITY_QUERY = (
+    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+    "pullRequests(states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}){nodes{"
+    "number commits(last:20){nodes{commit{committedDate author{name}}}}}}}}"
+)
+
+
+def last_activity(repo: str) -> dict[int, str]:
+    """The newest commit of each open pull request that the train did not
+    make. When the last twenty are all the train's, the oldest of them: the
+    pull request's own last commit is older still, so it is never read as
+    staler than it is."""
+    owner, name = repo.split("/", 1)
+    data = _try_json(
+        "api", "graphql", "-f", f"query={_ACTIVITY_QUERY}", "-f", f"owner={owner}", "-f",
+        f"name={name}",
+    )  # fmt: skip
+    repository = ((data or {}).get("data") or {}).get("repository") or {}  # type: ignore[union-attr]
+    nodes = (repository.get("pullRequests") or {}).get("nodes") or []
+    found: dict[int, str] = {}
+    for node in nodes:
+        commits = [
+            (c.get("commit") or {}) for c in ((node or {}).get("commits") or {}).get("nodes") or []
+        ]
+        stamps = [str(c.get("committedDate") or "") for c in commits]
+        own = [
+            str(c.get("committedDate") or "")
+            for c in commits
+            if ((c.get("author") or {}).get("name") or "") != TRAIN_AUTHOR
+        ]
+        if own and max(own):
+            found[int(node["number"])] = max(own)
+        elif any(stamps):
+            found[int(node["number"])] = min(s for s in stamps if s)
+    return found
+
+
+def stale_sweep(repo: str, prs: list[dict], now: datetime) -> list[dict[str, object]]:
+    """One entry per abandoned-PR action (warn, close, unstale). A pull
+    request whose activity cannot be read is left alone."""
+    activity = last_activity(repo)
+    sweep: list[dict[str, object]] = []
+    for pr in prs:
+        if not stale_candidate(pr):
+            continue
+        number = int(pr["number"])
+        labels = {label["name"] for label in pr.get("labels", [])}
+        stamp = activity.get(number)
+        if not stamp:
+            continue
+        # A pull request opened today on old commits is not idle.
+        stamp = max(stamp, str(pr.get("createdAt") or ""))
+        idle_days = _age(stamp, now, 86400)
+        if idle_days is None:
+            continue
+        labelled_days = None
+        if STALE_LABEL in labels and idle_days >= CLOSE_DAYS:
+            events = merge_freeze.issue_events(repo, number, lambda args: _try_json(*args))
+            since = merge_freeze.labelled_at(events, STALE_LABEL)
+            labelled_days = None if since is None else (now - since).total_seconds() / 86400
+        verdict = stale_verdict(labels, idle_days, labelled_days)
+        if verdict:
+            sweep.append({"number": number, "action": verdict, "idle_days": round(idle_days, 1)})
+    return sweep
+
+
+# GitHub computes mergeability on demand: the first listing after a push to
+# main answers UNKNOWN for every pull request and only starts the computation.
+SETTLE_ATTEMPTS = 6
+SETTLE_SECONDS = 10.0
+
+
+def open_pull_requests(
+    repo: str,
+    attempts: int = SETTLE_ATTEMPTS,
+    pause: float = SETTLE_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[dict]:
+    """Open pull requests against main, asked again while GitHub still computes
+    whether the eligible ones merge.
+
+    The tick a push to main starts is the one that should update the branches
+    that push put in conflict, and it read UNKNOWN for all of them: it waited
+    on every pull request and did nothing.
+    """
+    prs: list[dict] = []
+    for attempt in range(max(1, attempts)):
+        listing = gh_json(
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--base",
+            "main",
+            "--limit",
+            "100",
+            "--json",
+            "id,number,title,headRefName,headRefOid,isDraft,labels,baseRefName,"
+            "isCrossRepository,mergeable,mergeStateStatus,autoMergeRequest,author,createdAt",
+        )
+        prs = listing if isinstance(listing, list) else []
+        computing = sum(1 for pr in prs if eligible(pr) and pr.get("mergeable") == "UNKNOWN")
+        if not computing or attempt + 1 >= attempts:
+            break
+        print(f"[train] mergeability of {computing} pull request(s) not computed yet; asking again")
+        sleep(pause)
+    return prs
+
+
+def freeze_lookup(
+    repo: str, now: datetime
+) -> tuple[Callable[[int], merge_freeze.Freeze | None], list[merge_freeze.Freeze]]:
+    """(the freeze that holds a given pull request back, the expired freezes).
+    One listing per tick, however many pull requests ask."""
+    cache: dict[tuple[str, ...], object] = {}
+
+    def fetch(args: list[str]) -> object:
+        key = tuple(args)
+        if key not in cache:
+            cache[key] = _try_json(*args)
+        return cache[key]
+
+    def held_by(number: int) -> merge_freeze.Freeze | None:
+        return merge_freeze.active_freeze(repo, fetch, now=now, exempt=number)
+
+    expired = [f for f in merge_freeze.freezes(repo, fetch, now=now) if f.expired]
+    return held_by, expired
+
+
+def watch_entry(repo: str, entry: dict) -> dict[str, object] | None:
+    """``watch_verdict`` for a planned entry, plus whether its comment is
+    already on the pull request (``told``) for this head."""
+    idle = entry.get("idle_minutes")
+    failing = None
+    if entry.get("state") == "failure" and idle is not None and idle >= RED_IDLE_MINUTES:
+        failing = failing_jobs(repo, entry.get("run_id"))  # type: ignore[arg-type]
+    verdict = watch_verdict(
+        number=int(entry["number"]),
+        action=str(entry["action"]),
+        state=str(entry.get("state") or ""),
+        merge_state=str(entry.get("merge_state") or ""),
+        labels=set(entry.get("labels") or ()),
+        auto_merge=bool(entry.get("auto_merge")),
+        idle_minutes=idle,  # type: ignore[arg-type]
+        frozen=bool(entry.get("frozen_by")),
+        failing=failing,
+    )
+    if verdict and verdict["comment"]:
+        verdict["told"] = already_told(repo, int(entry["number"]), stuck_marker(str(entry["head"])))
+    return verdict
+
+
+def plan(repo: str, max_updates: int, now: datetime | None = None) -> dict[str, object]:
+    """Decide what the train does this tick. Reads only; runs no PR code."""
+    now = now or _now()
+    prs = open_pull_requests(repo)
+    queued = merge_queue_numbers(repo)
+    queue_runs = queue_runs_by_pr(queue_group_runs(repo)) if queued is not None else {}
+    held_by, expired = freeze_lookup(repo, now)
+    git("fetch", "--quiet", "origin", "main")
+    main_sha = git("rev-parse", "origin/main").stdout.strip()
+    order = sorted(
+        (p for p in prs or [] if eligible(p)),  # type: ignore[union-attr]
+        key=lambda p: (not any(lb["name"] == "priority" for lb in p["labels"]), p["number"]),
+    )
+    print(f"[train] {len(order)} eligible pull request(s); merge queue: {queued is not None}")
+    entries: list[dict[str, object]] = []
+    landing = False
+    for pr in order:
+        number, branch, sha = pr["number"], pr["headRefName"], pr["headRefOid"]
+        git("fetch", "--quiet", "origin", branch, check=False)
+        behind = git("merge-base", "--is-ancestor", main_sha, sha, check=False).returncode != 0
+        runs = gate_runs(repo, sha)
+        state, run_id = run_state(runs)
+        mergeable = pr.get("mergeable") or ""
+        action = decide(
+            mergeable,
+            state,
+            behind,
+            queued=queued is not None and number in queued,
+            queue_failed=queue_rejected(queue_runs.get(number), runs),
+        )
+        note = f"CI {state}, {mergeable or 'unknown'}"
+        freeze = held_by(number)
+        if action == "merge" and freeze:
+            # Updates, approvals and reruns go on; nothing else lands.
+            action, note = "frozen", merge_freeze.describe(freeze)
+        if action == "merge" and queued is None:
+            if landing:
+                action, note = (
+                    "wait",
+                    "green; one direct landing per tick, next tick sees the new main",
+                )
+            landing = True
+        entries.append(
+            {
+                "number": number,
+                "branch": branch,
+                "head": sha,
+                "id": pr.get("id", ""),
+                "action": action,
+                "run_id": run_id,
+                "note": note,
+                "state": state,
+                "labels": sorted(lb["name"] for lb in pr.get("labels", [])),
+                "merge_state": pr.get("mergeStateStatus") or "",
+                "auto_merge": bool(pr.get("autoMergeRequest")),
+                "idle_minutes": _age(run_finished_at(runs), now, 60),
+                "frozen_by": freeze.number if freeze else None,
+            }
+        )
+    granted = grant_updates([e for e in entries if e["action"] == "update"], max_updates)
+    for entry in entries:
+        if entry["action"] == "update" and entry["number"] not in granted:
+            entry["action"], entry["note"] = "wait", "needs an update, waits for a free slot"
+        entry["watch"] = watch_entry(repo, entry)
+    notices = [
+        {"number": f.number, "marker": freeze_marker(f), "age_hours": round(f.age_hours, 1)}
+        for f in expired
+    ]
+    notices = [n for n in notices if not already_told(repo, int(n["number"]), str(n["marker"]))]
+    return {
+        "repo": repo,
+        "main": main_sha,
+        "queue": queued is not None,
+        "entries": entries,
+        "expired_freezes": notices,
+        "stale": stale_sweep(repo, prs, now),
+    }
+
+
+# ----- integrate: merge -> resolve -> finish, one worktree per pull request
+
+
+def _updates(data: dict) -> list[dict]:
+    return [e for e in data.get("entries", []) if e.get("action") == "update"]
+
+
+def _state_file(root: Path, number: int) -> Path:
+    return root / "state" / f"pr-{number}.json"
+
+
+def _save_state(root: Path, number: int, state: dict) -> None:
+    path = _state_file(root, number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _load_state(root: Path, number: int) -> dict | None:
+    path = _state_file(root, number)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _worktree(root: Path, number: int) -> Path:
+    return root / "wt" / f"pr-{number}"
+
+
+def merge_main_into(
+    wt: Path, head: str, main_sha: str, branch: str, checkout: Path = REPO_ROOT
+) -> dict[str, object]:
+    """Merge main into ``head`` in a new worktree; resolve what needs no AI.
+
+    ``status``: up-to-date | merged | pending (semantic conflicts left in the
+    worktree, the merge still in progress for ``resolve``).
+    """
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    git("worktree", "add", "--quiet", "--detach", str(wt), head, cwd=checkout)
+    if git("merge-base", "--is-ancestor", main_sha, "HEAD", check=False, cwd=wt).returncode == 0:
+        return {"status": "up-to-date"}
+    state: dict[str, object] = {
+        "status": "merged",
+        "branch": branch,
+        "resolved": [],
+        "ai_resolved": [],
+        "regen": [],
+    }
+    moved = package_move(main_sha, wt)
+    if moved:
+        before, move = moved
+        if git("merge-base", "--is-ancestor", before, "HEAD", check=False, cwd=wt).returncode == 0:
+            replay_package_move(before, move, wt)
+        else:
+            # This tick brings the branch to the last commit of the old
+            # layout; the next one replays the move on top of that.
+            main_sha = before
+            state["onto"] = before
+    message = f"Merge main into {branch}"
+    result = git("merge", "--no-edit", "--no-ff", "-m", message, main_sha, check=False, cwd=wt)
+    if result.returncode != 0:
+        res = resolve_conflicts("theirs", "", wt)
+        state["resolved"] = res.resolved
+        state["regen"] = sorted(res.regenerate)
+        left = conflicted_files(wt)
+        if left:
+            state["status"] = "pending"
+            state["unresolved"] = left
+            return state
+        git("commit", "--no-edit", check=False, cwd=wt)
+    return state
+
+
+def integrate_merge(root: Path, data: dict, checkout: Path = REPO_ROOT) -> int:
+    """Phase 1 (no secrets, no PR code). Returns how many still conflict."""
+    pending = 0
+    for entry in _updates(data):
+        number = entry["number"]
+        try:
+            state = merge_main_into(
+                _worktree(root, number), entry["head"], data["main"], entry["branch"], checkout
+            )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            # One broken branch must never stop the train for the others.
+            print(f"[train] #{number}: merge crashed: {exc}", flush=True)
+            state = {"status": "crashed", "error": type(exc).__name__}
+        pending += state["status"] == "pending"
+        _save_state(root, number, state)
+    return pending
+
+
+def integrate_resolve(root: Path, data: dict, resolver_cmd: str) -> None:
+    """Phase 2 (API keys; runs before any PR code on this machine)."""
+    for entry in _updates(data):
+        number = entry["number"]
+        state = _load_state(root, number)
+        if not state or state.get("status") != "pending":
+            continue
+        wt = _worktree(root, number)
+        res = resolve_conflicts("theirs", resolver_cmd, wt)
+        state["resolved"] = sorted({*state.get("resolved", []), *res.resolved})
+        state["ai_resolved"] = res.ai_resolved
+        state["regen"] = sorted({*state.get("regen", []), *res.regenerate})
+        state["unresolved"] = conflicted_files(wt)
+        _save_state(root, number, state)
+
+
+def integrate_finish(root: Path, data: dict) -> None:
+    """Phase 3 (no secrets; regeneration runs PR code). Bundles each result."""
+    for entry in _updates(data):
+        number = entry["number"]
+        state = _load_state(root, number)
+        if not state:
+            continue
+        wt = _worktree(root, number)
+        try:
+            state = _finish_one(root, wt, number, state, (entry["head"], data["main"]))
+        except (subprocess.CalledProcessError, OSError) as exc:
+            print(f"[train] #{number}: finish crashed: {exc}", flush=True)
+            state = {"status": "crashed", "error": type(exc).__name__}
+        _save_state(root, number, state)
+
+
+def _finish_one(root: Path, wt: Path, number: int, state: dict, known: tuple[str, str]) -> dict:
+    """Conclude one merge, regenerate, and bundle only the new commits
+    (``known`` = the PR head and main, which the apply job already has)."""
+    if state.get("status") == "pending":
+        left = conflicted_files(wt)
+        if left:
+            git("merge", "--abort", check=False, cwd=wt)
+            return {**state, "status": "conflict", "unresolved": left}
+        git("commit", "--no-edit", check=False, cwd=wt)
+        state = {**state, "status": "merged"}
+    if state.get("status") != "merged":
+        return state
+    if state.get("regen"):
+        outcome = regenerate_and_commit(set(state["regen"]), wt)
+        if outcome is None:
+            return {**state, "status": "conflict", "unresolved": ["<regenerated files rejected>"]}
+        state = {**state, **outcome}
+    if pin_bundle(str(state.get("onto") or known[1]), wt, str(state.get("branch", ""))):
+        state = {**state, "bundle": "kept main's"}
+    ref = f"refs/train/pr-{number}"
+    git("update-ref", ref, "HEAD", cwd=wt)
+    bundle = root / "bundles" / f"pr-{number}.bundle"
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    git("bundle", "create", str(bundle), ref, "--not", *known, cwd=wt)
+    sha = git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+    return {**state, "status": "ready", "sha": sha}
+
+
+def cleanup_worktrees(root: Path, checkout: Path = REPO_ROOT) -> None:
+    for wt in sorted((root / "wt").glob("pr-*")):
+        git("worktree", "remove", "--force", str(wt), check=False, cwd=checkout)
+    git("worktree", "prune", check=False, cwd=checkout)
+
+
+# ----- apply: the only phase with a write token; it runs no PR code
+
+
+def enqueue(entry: dict) -> int:
+    """Add a pull request to main's merge queue, pinned to the tested head."""
+    return gh(
+        "api",
+        "graphql",
+        "-f",
+        f"query={_ENQUEUE}",
+        "-f",
+        f"id={entry['id']}",
+        "-f",
+        f"head={entry['head']}",
+    )
+
+
+def dispatch_ci(ref: str) -> None:
+    """Stand-in for the push run a GITHUB_TOKEN merge never fires (direct-merge
+    fallback only; queue merges fire a real push). The dispatch input's
+    default would add every macOS lane (~10x runner cost) to each merge."""
+    gh("workflow", "run", "ci.yml", "--ref", ref, "-f", "full=false", "-f", "include_macos=false")
+
+
+def _bundle_is_safe(sha: str, entry: dict, main_sha: str, checkout: Path) -> bool:
+    """The integrate job ran PR code, so treat its bundle as data: it must
+    build on both the PR's planned head and the planned main. Its content is
+    no more trusted than any push to the branch: CI and the queue test it."""
+    for ancestor in (entry["head"], main_sha):
+        if (
+            git("merge-base", "--is-ancestor", ancestor, sha, check=False, cwd=checkout).returncode
+            != 0
+        ):
+            return False
+    return True
+
+
+_WORKFLOWS_BODY = (
+    "The merge train merged `main` into this branch, but could not push the result: "
+    "`main` changed files under `.github/workflows/`, and the train's `GITHUB_TOKEN` "
+    "may not push workflow changes. Merge `main` into this branch yourself (for example "
+    "`python scripts/agent_land.py --pr`), or configure the merge bot app "
+    "(`MERGE_APP_ID`), whose token may push workflow changes."
+)
+
+
+def push_rejection(stderr: str) -> str:
+    """Why a push was refused: ``workflows`` (the token lacks the permission
+    to touch .github/workflows) or ``moved`` (anything else, e.g. not a fast
+    forward because the author pushed meanwhile)."""
+    text = stderr.lower()
+    if "workflow" in text and ("permission" in text or "scope" in text):
+        return "workflows"
+    return "moved"
+
+
+def _report_once(entry: dict, repo: str, body: str, dry_run: bool) -> None:
+    """Comment and label a pull request the train cannot update - once: the
+    `needs-rebase` label marks it as told, so later ticks stay quiet."""
+    number = str(entry["number"])
+    if dry_run or "needs-rebase" in entry.get("labels", []):
+        return
+    gh("pr", "comment", number, "--repo", repo, "--body", body)
+    gh("pr", "edit", number, "--repo", repo, "--add-label", "needs-rebase")
+
+
+def apply_update(
+    root: Path, data: dict, entry: dict, dry_run: bool, checkout: Path = REPO_ROOT
+) -> str:
+    number, branch, repo = entry["number"], entry["branch"], data["repo"]
+    state = _load_state(root, number)
+    if state is None:
+        return "update was not prepared (integrate job failed or skipped); next tick"
+    status = state.get("status")
+    if status == "up-to-date":
+        return "already contains main; nothing to push"
+    if status == "crashed":
+        return f"update crashed ({state.get('error')}); left for the next tick"
+    if status in ("conflict", "pending"):
+        unresolved = [str(f) for f in state.get("unresolved", [])]
+        files = "\n".join(f"- `{f}`" for f in unresolved)
+        body = (
+            "The merge train could not bring this branch up to date with `main`: "
+            f"these files conflict and could not be resolved automatically.\n\n{files}\n\n"
+            "Resolve locally with `python scripts/agent_land.py --pr` (it rebases, "
+            "resolves generated files and lists what is left). The train retries on "
+            "the next push to this branch."
+        )
+        _report_once(entry, repo, body, dry_run)
+        return "conflict - " + ", ".join(unresolved)
+    if status != "ready":
+        return f"update in unexpected state {status!r}; next tick"
+    if dry_run:
+        return "would push update"
+    sha = str(state["sha"])
+    ref = f"refs/train/pr-{number}"
+    bundle = root / "bundles" / f"pr-{number}.bundle"
+    git("fetch", "--quiet", "origin", "main", branch, check=False, cwd=checkout)
+    fetch = git("fetch", "--quiet", str(bundle), f"+{ref}:{ref}", check=False, cwd=checkout)
+    if (
+        fetch.returncode != 0
+        or git("rev-parse", ref, check=False, cwd=checkout).stdout.strip() != sha
+    ):
+        return "update bundle missing or unreadable; next tick"
+    # A branch that predates the package move is first brought to the last
+    # commit before it - a commit of main's own history, never one the
+    # integrate job could make up.
+    onto = str(state.get("onto") or data["main"])
+    known = git("merge-base", "--is-ancestor", onto, data["main"], check=False, cwd=checkout)
+    if known.returncode != 0 or not _bundle_is_safe(sha, entry, onto, checkout):
+        return "update bundle rejected (not the planned head plus main); next tick"
+    push = git("push", "origin", f"{sha}:refs/heads/{branch}", check=False, cwd=checkout)
+    if push.returncode != 0:
+        reason = push_rejection(push.stderr)
+        print(f"[train] #{number}: push rejected:\n{push.stderr.strip()[-2000:]}", flush=True)
+        if reason == "workflows":
+            _report_once(entry, repo, _WORKFLOWS_BODY, dry_run)
+            return "update needs the `workflows` permission (main changed .github/workflows)"
+        return "update rejected (the branch moved); retry next tick"
+    gh("pr", "edit", str(number), "--repo", repo, "--remove-label", "needs-rebase")
+    ai = [str(f) for f in state.get("ai_resolved") or []]
+    if ai:
+        listing = ", ".join(f"`{f}`" for f in ai)
+        gh(
+            "pr",
+            "comment",
+            str(number),
+            "--repo",
+            repo,
+            "--body",
+            f"Merge train: conflicts in {listing} were resolved by the configured AI "
+            "resolver. CI re-runs on the result before anything lands; please skim them.",
+        )
+    # A GITHUB_TOKEN push parks the pull_request run in action_required; the
+    # next tick approves it (a dispatched run would never reach the PR).
+    return f"updated with main ({len(state.get('resolved', []))} conflicts auto-resolved)"
+
+
+class _Labels:
+    """Creates the train's labels once per run, the first time one is set
+    (``gh pr edit --add-label`` refuses a label the repository lacks)."""
+
+    def __init__(self, repo: str) -> None:
+        self.repo = repo
+        self.ready = False
+
+    def ensure(self) -> None:
+        if self.ready:
+            return
+        self.ready = True
+        for name, (color, description) in TRAIN_LABELS.items():
+            gh(
+                "label", "create", name, "--repo", self.repo, "--color", color,
+                "--description", description, "--force",
+            )  # fmt: skip
+
+
+def apply_watch(
+    entry: dict, verdict: dict | None, repo: str, dry_run: bool, labels: _Labels
+) -> str | None:
+    """Set or lift the ``stuck`` label for one entry; comment once per head."""
+    number = str(entry["number"])
+    has_label = STUCK_LABEL in (entry.get("labels") or [])
+    if verdict is None:
+        if not has_label:
+            return None
+        if not dry_run:
+            gh("pr", "edit", number, "--repo", repo, "--remove-label", STUCK_LABEL)
+        return f"#{number}: moving again{' (would lift' if dry_run else ' (lifted'} `stuck`)"
+    say = verdict.get("comment") and not verdict.get("told")
+    if dry_run:
+        return f"#{number}: stuck - {verdict['why']}; would label{' and comment' if say else ''}"
+    if not has_label:
+        labels.ensure()
+        gh("pr", "edit", number, "--repo", repo, "--add-label", STUCK_LABEL)
+    if say:
+        body = (
+            f"The merge train found this pull request stuck: {verdict['why']}.\n\n"
+            f"**Next step:** {verdict['step']}\n\n{stuck_marker(str(entry['head']))}"
+        )
+        gh("pr", "comment", number, "--repo", repo, "--body", body)
+    return f"#{number}: stuck - {verdict['why']}. {verdict['step']}"
+
+
+def apply_housekeeping(data: dict, dry_run: bool, labels: _Labels) -> list[str]:
+    """Expired-freeze notices and the abandoned-PR sweep."""
+    repo = data["repo"]
+    lines: list[str] = []
+    for notice in data.get("expired_freezes") or []:
+        number = str(notice["number"])
+        if dry_run:
+            lines.append(f"#{number}: merge freeze expired; would comment")
+            continue
+        body = f"{FREEZE_EXPIRED}\n\n{notice['marker']}"
+        gh("pr", "comment", number, "--repo", repo, "--body", body)
+        lines.append(f"#{number}: merge freeze expired ({notice.get('age_hours')} h); commented")
+    for item in data.get("stale") or []:
+        number, action = str(item["number"]), item["action"]
+        idle = f"no commit for {item.get('idle_days')} days"
+        if dry_run:
+            lines.append(f"#{number}: {idle}; would {action}")
+            continue
+        if action == "warn":
+            labels.ensure()
+            # Label first: if it cannot be set, no comment, so the next tick
+            # does not warn again. The marker guards against a repeat anyway.
+            if gh("pr", "edit", number, "--repo", repo, "--add-label", STALE_LABEL) != 0:
+                lines.append(f"#{number}: {idle}; could not label `stale`")
+                continue
+            if not already_told(repo, int(number), STALE_MARKER):
+                body = f"{STALE_WARNING}\n\n{STALE_MARKER}"
+                gh("pr", "comment", number, "--repo", repo, "--body", body)
+            lines.append(f"#{number}: {idle}; labelled `stale`")
+        elif action == "close":
+            gh("pr", "close", number, "--repo", repo, "--comment", STALE_CLOSING)
+            lines.append(f"#{number}: {idle}; closed")
+        elif action == "unstale":
+            gh("pr", "edit", number, "--repo", repo, "--remove-label", STALE_LABEL)
+            lines.append(f"#{number}: active again; lifted `stale`")
+    return lines
+
+
+def apply(root: Path, data: dict, dry_run: bool, token_is_bot: bool) -> int:
+    repo = data["repo"]
+    summary: list[str] = []
+    labels = _Labels(repo)
+    for entry in data.get("entries", []):
+        number, action, run_id = entry["number"], entry["action"], entry.get("run_id")
+        moved = False  # this tick pushed, enqueued or merged it: not stuck
+        verdict = entry.get("watch")
+        if action == "update":
+            try:
+                outcome = apply_update(root, data, entry, dry_run)
+            except (subprocess.CalledProcessError, OSError) as exc:
+                outcome = f"update push crashed ({type(exc).__name__}); left for the next tick"
+            summary.append(f"#{number}: {outcome}")
+            moved = outcome.startswith("updated with main")
+            if outcome.startswith("conflict") and not verdict:
+                verdict = watch_verdict(
+                    number=number, action=action, state="", merge_state="DIRTY",
+                    labels={"needs-rebase"}, auto_merge=False, idle_minutes=None,
+                )  # fmt: skip
+        elif action == "frozen":
+            summary.append(f"#{number}: green, not enqueued - {entry.get('note', '')}")
+        elif action == "merge" and data.get("queue") and token_is_bot:
+            # GitHub starts no merge_group run for an entry GITHUB_TOKEN added:
+            # it would wait in the queue until the timeout and block the rest.
+            summary.append(
+                f"#{number}: green, not enqueued - the merge queue needs the merge bot "
+                "token (MERGE_APP_ID); add it to the queue by hand meanwhile"
+            )
+        elif action == "merge" and data.get("queue"):
+            if dry_run:
+                summary.append(f"#{number}: would join the merge queue")
+                moved = True
+            elif enqueue(entry) == 0:
+                summary.append(f"#{number}: added to the merge queue")
+                moved = True
+            else:
+                summary.append(f"#{number}: merge queue refused it (head moved or not mergeable)")
+        elif action == "merge":
+            if dry_run:
+                summary.append(f"#{number}: would merge")
+                moved = True
+            elif gh(
+                "pr", "merge", str(number), "--repo", repo, "--squash",
+                "--match-head-commit", entry["head"],
+            ) == 0:  # fmt: skip
+                summary.append(f"#{number}: merged")
+                moved = True
+                if token_is_bot:
+                    dispatch_ci("main")  # a GITHUB_TOKEN merge fires no push event
+            else:
+                summary.append(f"#{number}: merge refused (protection or conflict)")
+        elif action in ("approve", "rerun"):
+            if dry_run:
+                code = None
+                summary.append(f"#{number}: would {action} CI run {run_id}")
+            elif action == "approve":
+                code = gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/approve")
+            else:
+                # Only the failed and cancelled jobs: a whole-run rerun of a
+                # full pipeline re-queues ~50 green jobs behind the runner limit.
+                code = gh("run", "rerun", str(run_id), "--failed", "--repo", repo)
+            if code == 0:
+                summary.append(f"#{number}: CI run {run_id} {action}d")
+            elif code is not None:
+                summary.append(
+                    f"#{number}: could not {action} CI run {run_id} - approve it in the "
+                    "Actions tab or configure the merge bot app (MERGE_APP_ID)"
+                )
+        elif action == "queued":
+            summary.append(f"#{number}: in the merge queue")
+        elif action == "held":
+            summary.append(
+                f"#{number}: the merge queue failed this head; push a fix (or re-add it "
+                "by hand if the failure was a flake)"
+            )
+        else:
+            summary.append(f"#{number}: waiting ({entry.get('note', '')})")
+        watched = apply_watch(entry, None if moved else verdict, repo, dry_run, labels)
+        if watched:
+            summary.append(watched)
+    summary += apply_housekeeping(data, dry_run, labels)
+    lines = ["## Merge train", "", *[f"- {line}" for line in summary]]
+    print("\n".join(lines))
+    target = os.environ.get("GITHUB_STEP_SUMMARY")
+    if target:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    return 0
+
+
+def train(repo: str, max_updates: int, resolver_cmd: str, dry_run: bool, token_is_bot: bool) -> int:
+    """Every phase in one process (a local or manual run)."""
+    root = Path(tempfile.mkdtemp(prefix="merge-train-"))
+    try:
+        data = plan(repo, max_updates)
+        if integrate_merge(root, data) and resolver_cmd:
+            integrate_resolve(root, data, resolver_cmd)
+        integrate_finish(root, data)
+        return apply(root, data, dry_run, token_is_bot)
+    finally:
+        cleanup_worktrees(root)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _set_output(name: str, value: object) -> None:
+    target = os.environ.get("GITHUB_OUTPUT")
+    if target:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(f"{name}={value}\n")
+
+
+def _read_plan(root: Path) -> dict:
+    return json.loads((root / "plan.json").read_text(encoding="utf-8"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    up = sub.add_parser("update")
+    up.add_argument("--onto", default="origin/main")
+    up.add_argument("--mode", choices=("merge", "rebase"), default="rebase")
+    up.add_argument("--resolver-cmd", default=os.environ.get("CONFLICT_RESOLVER_CMD", ""))
+    tr = sub.add_parser("train")
+    tr.add_argument("--repo", required=True)
+    tr.add_argument("--max-updates", type=int, default=3)
+    tr.add_argument("--resolver-cmd", default=os.environ.get("CONFLICT_RESOLVER_CMD", ""))
+    tr.add_argument("--dry-run", action="store_true")
+    tr.add_argument("--token-is-bot", action="store_true")
+    pl = sub.add_parser("plan")
+    pl.add_argument("--repo", required=True)
+    pl.add_argument("--dir", type=Path, required=True)
+    pl.add_argument("--max-updates", type=int, default=3)
+    for name in ("merge", "resolve", "finish"):
+        phase = sub.add_parser(name)
+        phase.add_argument("--dir", type=Path, required=True)
+        if name == "resolve":
+            phase.add_argument(
+                "--resolver-cmd", default=os.environ.get("CONFLICT_RESOLVER_CMD", "")
+            )
+    ap = sub.add_parser("apply")
+    ap.add_argument("--dir", type=Path, required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--token-is-bot", action="store_true")
+    args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    if args.cmd == "update":
+        report = update(args.onto, args.mode, args.resolver_cmd)
+        print(json.dumps(report, indent=2))
+        return 0 if report["status"] != "conflict" else 2
+    if args.cmd == "train":
+        return train(
+            args.repo, args.max_updates, args.resolver_cmd, args.dry_run, args.token_is_bot
+        )
+    if args.cmd == "plan":
+        data = plan(args.repo, args.max_updates)
+        args.dir.mkdir(parents=True, exist_ok=True)
+        (args.dir / "plan.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+        for entry in data["entries"]:  # type: ignore[union-attr]
+            print(f"[train] #{entry['number']}: {entry['action']} ({entry['note']})")
+        _set_output("updates", len(_updates(data)))
+        return 0
+    data = _read_plan(args.dir)
+    if args.cmd == "merge":
+        _set_output("pending", integrate_merge(args.dir, data))
+        return 0
+    if args.cmd == "resolve":
+        integrate_resolve(args.dir, data, args.resolver_cmd)
+        return 0
+    if args.cmd == "finish":
+        integrate_finish(args.dir, data)
+        return 0
+    return apply(args.dir, data, args.dry_run, args.token_is_bot)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

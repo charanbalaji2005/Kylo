@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""Sharded, process-isolated pytest runner (the CI test engine).
+
+Why this exists: one monolithic ``pytest tests/`` process took 75-95 minutes
+on a 4-core runner and routinely hit the job timeout. A single wedged test ate
+the whole budget, and module state leaked across the ~2 000 test files.
+
+How it works (a per-file runner):
+
+1. **Discover** every ``test_*.py`` / ``*_test.py`` under the roots.
+2. **Shard** (``--shard 2/6``): longest-processing-time bin packing over the
+   per-file duration cache, so shards finish together. Every shard computes
+   the same packing, so no coordination is needed.
+3. **Batch**: consecutive files of one directory run in one pytest process
+   (the ~1.5 s interpreter + conftest start-up is paid once per batch).
+4. **Isolate on failure**: a failed or timed-out batch is re-run file by file
+   in fresh processes, and a failed file gets one more fresh attempt. A pass
+   on that attempt is reported as FLAKY, not as a failure.
+5. **Bound**: every process has a wall-clock budget and is killed with its
+   whole process tree, so a hang costs one file, never the job. A file that
+   runs out of its budget alone gets one more attempt with a longer one: a
+   file the history has never timed starts on the generic floor, and a slow
+   file on a loaded runner is not a hang.
+
+Outputs: ``--report`` (JSON: failed test ids, flaky files, counts) and
+``--junit-out`` (merged JUnit XML), plus ``--durations-out`` (timings of files
+that passed on the first attempt or alone after a timeout — a killed run has no
+timing, so a hang can never ratchet its own budget).
+
+The runner exits 1 when any test failed for real; whether that blocks the
+build is ``test_ratchet.py``'s decision (known failures are baselined).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import xml.etree.ElementTree as ET  # noqa: S405 - parses our own pytest output
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MARKERS = (
+    "not skip_ci and not slow and not openclaw_live and not voice_latency and not eval"
+)
+_SKIP_DIRS = {"__pycache__", "node_modules", "fakes", "fixtures", ".pytest_cache"}
+DEFAULT_DURATION = 4.0  # seconds, for a file the cache has never seen
+MIN_FILE_TIMEOUT = 300.0
+MAX_FILE_TIMEOUT = 900.0
+BATCH_TARGET_SECONDS = 45.0
+BATCH_MAX_FILES = 12
+MAX_BATCH_TIMEOUT = 1800.0
+BATCH_TIMEOUT_FACTOR = 6.0  # times the batch's own history
+# A file that timed out alone runs once more with this multiple of its budget.
+# The floor is a guess for a file without history: on Windows a file whose
+# tests each start a contained command took 160 s on a quiet runner and more
+# than the 300 s floor on a loaded one, and every such timeout ejected a pull
+# request from the merge queue. A real hang now costs the floor three times.
+TIMEOUT_RETRY_FACTOR = 2.0
+_OK_EXIT_CODES = {0, 5}  # 5 = every test deselected / none collected
+# A new batch waits while less than this much memory is left to commit. A local
+# run shares the machine with the user's apps: eight batches on a box already
+# near its commit limit once ran Windows out of virtual memory, and every
+# process that allocated next (a Claude Code pane, OBS) died with 0xC0000409.
+MEMORY_RESERVE_BYTES = 6 * 1024**3
+MEMORY_POLL_SECONDS = 2.0
+
+
+# --------------------------------------------------------------------------- discovery
+
+
+def discover(roots: list[str], repo: Path = REPO_ROOT) -> list[str]:
+    files: set[str] = set()
+    for root in roots:
+        base = (repo / root).resolve()
+        if base.is_file():
+            files.add(base.relative_to(repo).as_posix())
+            continue
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.py"):
+            rel = path.relative_to(repo)
+            if any(part in _SKIP_DIRS for part in rel.parts):
+                continue
+            if path.name.startswith("test_") or path.name.endswith("_test.py"):
+                files.add(rel.as_posix())
+    return sorted(files)
+
+
+def load_durations(path: Path | None) -> dict[str, float]:
+    if not path or not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[runner] duration cache unreadable ({exc}); using defaults", flush=True)
+        return {}
+    return {str(k): float(v) for k, v in data.items() if isinstance(v, int | float)}
+
+
+def estimate(file: str, durations: dict[str, float]) -> float:
+    return max(0.5, durations.get(file, DEFAULT_DURATION))
+
+
+def shard(files: list[str], index: int, total: int, durations: dict[str, float]) -> list[str]:
+    """Deterministic LPT bin packing; returns shard ``index`` (1-based) of ``total``."""
+    if total <= 1:
+        return list(files)
+    bins: list[tuple[float, int, list[str]]] = [(0.0, i, []) for i in range(total)]
+    for file in sorted(files, key=lambda f: (-estimate(f, durations), f)):
+        load, idx, members = min(bins, key=lambda b: (b[0], b[1]))
+        members.append(file)
+        bins[idx] = (load + estimate(file, durations), idx, members)
+    return sorted(bins[index - 1][2])
+
+
+def make_batches(files: list[str], durations: dict[str, float]) -> list[list[str]]:
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_dir = None
+    load = 0.0
+    for file in sorted(files):
+        directory = file.rsplit("/", 1)[0]
+        cost = estimate(file, durations)
+        # A file that alone exceeds the target always runs by itself.
+        if current and (
+            directory != current_dir
+            or load + cost > BATCH_TARGET_SECONDS
+            or len(current) >= BATCH_MAX_FILES
+            or cost > BATCH_TARGET_SECONDS
+        ):
+            batches.append(current)
+            current, load = [], 0.0
+        current.append(file)
+        current_dir = directory
+        load += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def file_timeout(file: str, durations: dict[str, float]) -> float:
+    return min(MAX_FILE_TIMEOUT, max(MIN_FILE_TIMEOUT, 3 * durations.get(file, 0.0)))
+
+
+def retry_timeout(file: str, durations: dict[str, float]) -> float:
+    """Wall clock for the one attempt a timed-out file gets on its own."""
+    return min(MAX_FILE_TIMEOUT, TIMEOUT_RETRY_FACTOR * file_timeout(file, durations))
+
+
+def batch_timeout(batch: list[str], durations: dict[str, float]) -> float:
+    """Wall clock for one batch: its slowest file's budget, or a multiple of its load.
+
+    A batch is built to ~45 s of history. Summing every file's five-minute
+    floor gave a twelve-file batch thirty minutes, so one wedged test held a
+    shard until the job timeout killed it without a report. A batch killed
+    early costs nothing but time: each of its files runs again alone.
+    """
+    load = sum(estimate(file, durations) for file in batch)
+    slowest = max(file_timeout(file, durations) for file in batch)
+    return min(MAX_BATCH_TIMEOUT, max(slowest, BATCH_TIMEOUT_FACTOR * load))
+
+
+# --------------------------------------------------------------------------- execution
+
+
+def available_memory() -> int | None:
+    """Bytes the OS can still hand out, or None where it cannot be read.
+
+    Windows reports the commit headroom (RAM plus page file): that is the
+    limit an allocation fails against. Linux reports MemAvailable.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullAvailPageFile)
+    try:
+        with open("/proc/meminfo", encoding="ascii") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None  # macOS and other systems without /proc: no gate
+    return None
+
+
+class MemoryGate:
+    """Holds back a new batch while the machine is short of memory.
+
+    A batch only waits while another one is running, so the gate can slow a
+    run down but never stall it: with nothing else in flight the next batch
+    always starts, and its finish is what frees the memory others wait for.
+    """
+
+    def __init__(
+        self,
+        reserve: int = MEMORY_RESERVE_BYTES,
+        probe=available_memory,
+        poll_seconds: float = MEMORY_POLL_SECONDS,
+    ):
+        self.reserve = reserve
+        self.probe = probe
+        self.poll_seconds = poll_seconds
+        self.running = 0
+        self.waits = 0
+        self._cond = threading.Condition()
+
+    def _short(self) -> bool:
+        free = self.probe()
+        return free is not None and free < self.reserve
+
+    def acquire(self) -> None:
+        with self._cond:
+            warned = False
+            while self.running > 0 and self._short():
+                if not warned:
+                    self.waits += 1
+                    warned = True
+                    print(
+                        f"[runner] under {self.reserve // 1024**3} GiB memory left; "
+                        f"waiting for one of {self.running} running batches",
+                        flush=True,
+                    )
+                self._cond.wait(self.poll_seconds)
+            self.running += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self.running -= 1
+            self._cond.notify_all()
+
+
+@dataclass
+class RunResult:
+    files: list[str]
+    exit_code: int
+    duration: float
+    timed_out: bool
+    failed_ids: list[str] = field(default_factory=list)
+    file_seconds: dict[str, float] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+    junit: Path | None = None
+    log_tail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.timed_out and self.exit_code in _OK_EXIT_CODES and not self.failed_ids
+
+
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(  # noqa: S603
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],  # noqa: S607
+                capture_output=True,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[runner] could not kill process tree {proc.pid}: {exc}", flush=True)
+    try:
+        proc.kill()
+    except OSError:
+        pass  # already gone - the tree kill above reaped it
+
+
+def _module_to_file(classname: str, files: list[str]) -> str | None:
+    dotted = classname.replace(".", "/")
+    best = None
+    for file in files:
+        stem = file[:-3]
+        if dotted == stem or dotted.startswith(stem + "/"):
+            if best is None or len(stem) > len(best[:-3]):
+                best = file
+    return best
+
+
+def parse_junit(path: Path, files: list[str]) -> tuple[list[str], dict[str, float], dict[str, int]]:
+    """Return (failed ids, seconds per file, counts) from one pytest JUnit file."""
+    failed: list[str] = []
+    seconds: dict[str, float] = {}
+    counts = {"tests": 0, "passed": 0, "failed": 0, "skipped": 0}
+    if not path.is_file():
+        return failed, seconds, counts
+    try:
+        root = ET.parse(path).getroot()  # noqa: S314 - our own pytest output
+    except ET.ParseError as exc:
+        print(f"[runner] unreadable JUnit {path.name}: {exc}", flush=True)
+        return failed, seconds, counts
+    for case in root.iter("testcase"):
+        classname = case.get("classname", "")
+        name = case.get("name", "")
+        counts["tests"] += 1
+        owner = _module_to_file(classname, files) or (files[0] if len(files) == 1 else "")
+        seconds[owner] = seconds.get(owner, 0.0) + float(case.get("time", 0) or 0)
+        if case.find("failure") is not None or case.find("error") is not None:
+            counts["failed"] += 1
+            failed.append(f"{classname}::{name}")
+        elif case.find("skipped") is not None:
+            counts["skipped"] += 1
+        else:
+            counts["passed"] += 1
+    return failed, seconds, counts
+
+
+class Runner:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        durations: dict[str, float],
+        workdir: Path,
+        gate: MemoryGate | None = None,
+    ):
+        self.args = args
+        self.durations = durations
+        self.workdir = workdir
+        self.gate = gate or MemoryGate()
+        self._seq = 0
+        self._lock = threading.Lock()
+        # The whole shard's wall clock. Batch budget plus isolation and retry
+        # runs can outlast the CI job's timeout; the job is then cancelled with
+        # no report and no log, so a hang names nothing (merge-queue run
+        # 40485520423, tests-windows (6)). Past the deadline nothing new starts
+        # and a running process is stopped: the report still gets written.
+        minutes = getattr(args, "deadline_minutes", None)
+        self.deadline = time.monotonic() + 60 * minutes if minutes else None
+
+    def _next_id(self) -> int:
+        with self._lock:
+            self._seq += 1
+            return self._seq
+
+    def run(self, files: list[str], timeout: float) -> RunResult:
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                return RunResult(
+                    files,
+                    -1,
+                    0.0,
+                    True,
+                    [f"{f}::<shard deadline>" for f in files],
+                    log_tail="not started: the shard's deadline had passed",
+                )
+            timeout = min(timeout, left)
+        run_id = self._next_id()
+        junit = self.workdir / f"run-{run_id:05d}.xml"
+        log = self.workdir / f"run-{run_id:05d}.log"
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            *files,
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-o",
+            "faulthandler_timeout=240",
+            f"--basetemp={self.workdir / f'tmp-{run_id:05d}'}",
+            f"--junitxml={junit}",
+            "-m",
+            self.args.markers,
+            *shlex.split(self.args.pytest_args or ""),
+        ]
+        env = dict(os.environ)
+        env.setdefault("PYTHONUTF8", "1")
+        env["JARVIS_TEST_RUNNER_ISOLATED"] = "1"
+        popen_kwargs: dict[str, object] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+        self.gate.acquire()
+        started = time.monotonic()
+        timed_out = False
+        try:
+            with log.open("wb") as sink:
+                proc = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    cwd=REPO_ROOT,
+                    stdout=sink,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    env=env,
+                    **popen_kwargs,  # type: ignore[arg-type]
+                )
+                try:
+                    exit_code = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    _kill_tree(proc)
+                    exit_code = proc.wait()
+        finally:
+            self.gate.release()
+        duration = time.monotonic() - started
+        failed, seconds, counts = parse_junit(junit, files)
+        tail = ""
+        if timed_out or exit_code not in _OK_EXIT_CODES or failed:
+            text = log.read_text(encoding="utf-8", errors="replace")
+            tail = "\n".join(text.splitlines()[-60:])
+            if timed_out:
+                failed = failed or [f"{f}::<timeout {int(timeout)}s>" for f in files]
+            elif not failed:
+                failed = [f"{f}::<pytest exit {exit_code}>" for f in files]
+        return RunResult(
+            files, exit_code, duration, timed_out, failed, seconds, counts, junit, tail
+        )
+
+    def run_unit(self, batch: list[str]) -> dict[str, object]:
+        """Run one batch with isolation-on-failure and a flaky retry."""
+        budget = batch_timeout(batch, self.durations)
+        first = self.run(batch, budget)
+        outcome: dict[str, object] = {"runs": [first], "flaky": [], "first_pass": [], "slow": []}
+        if first.ok:
+            outcome["first_pass"] = list(batch)
+            return outcome
+        runs: list[RunResult] = []
+        flaky: list[str] = []
+        slow: list[str] = []
+        for file in batch:
+            budget_one = file_timeout(file, self.durations)
+            single = first if len(batch) == 1 else self.run([file], budget_one)
+            if not single.ok:
+                timed_out = single.timed_out
+                again = retry_timeout(file, self.durations) if timed_out else budget_one
+                retry = self.run([file], again)
+                if retry.ok:
+                    flaky.append(file)
+                    if timed_out:
+                        # Its real duration, so the next history gives it room.
+                        slow.append(file)
+                        print(
+                            f"[runner] SLOW: {file} passed in {retry.duration:.0f}s "
+                            f"after running out of {int(budget_one)}s",
+                            flush=True,
+                        )
+                    single = retry
+            runs.append(single)
+        outcome["runs"] = runs
+        outcome["flaky"] = flaky
+        outcome["slow"] = slow
+        return outcome
+
+
+# --------------------------------------------------------------------------- reporting
+
+
+def merge_junit(paths: list[Path], out: Path) -> None:
+    merged = ET.Element("testsuites")
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            root = ET.parse(path).getroot()  # noqa: S314 - our own pytest output
+        except ET.ParseError as exc:
+            print(f"[runner] skipping unreadable JUnit {path.name}: {exc}", flush=True)
+            continue
+        suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+        merged.extend(suites)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(merged).write(out, encoding="utf-8", xml_declaration=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("roots", nargs="*", default=["tests"], help="Discovery roots.")
+    parser.add_argument("--files-from", type=Path, help="Explicit file list (one per line).")
+    parser.add_argument("--shard", default="1/1", help="i/n — run shard i of n.")
+    parser.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    parser.add_argument("--markers", default=DEFAULT_MARKERS)
+    parser.add_argument("--pytest-args", default="", help="Extra args for every pytest run.")
+    parser.add_argument("--durations", type=Path, default=REPO_ROOT / "test_durations.json")
+    parser.add_argument("--durations-out", type=Path)
+    parser.add_argument("--report", type=Path, default=Path("test-report.json"))
+    parser.add_argument("--junit-out", type=Path, default=Path("report.xml"))
+    parser.add_argument("--list", action="store_true", help="Print the shard's files and exit.")
+    parser.add_argument(
+        "--deadline-minutes",
+        type=float,
+        help="Wall clock for the whole shard; keep it under the CI job's timeout.",
+    )
+    args = parser.parse_args(argv)
+    # Windows consoles default to cp1252; a test log with box-drawing
+    # characters must never crash the runner that is reporting it (AP-1).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+    index, total = (int(x) for x in args.shard.split("/", 1))
+    durations = load_durations(args.durations)
+    if args.files_from:
+        wanted = [line.strip() for line in args.files_from.read_text(encoding="utf-8").splitlines()]
+        files = sorted({f for f in wanted if f and (REPO_ROOT / f).is_file()})
+    else:
+        files = discover(args.roots)
+    mine = shard(files, index, total, durations)
+    if args.list:
+        print("\n".join(mine))
+        return 0
+
+    print(
+        f"[runner] shard {index}/{total}: {len(mine)} of {len(files)} files, "
+        f"{args.workers} workers, markers={args.markers!r}",
+        flush=True,
+    )
+    batches = make_batches(mine, durations)
+    started = time.monotonic()
+    workdir = Path(tempfile.mkdtemp(prefix="jarvis-tests-"))
+    runner = Runner(args, durations, workdir)
+    all_runs: list[RunResult] = []
+    flaky: list[str] = []
+    first_pass: list[str] = []
+    slow: list[str] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(runner.run_unit, batch) for batch in batches]
+        for future in futures:
+            outcome = future.result()
+            runs = outcome["runs"]  # type: ignore[assignment]
+            all_runs.extend(runs)  # type: ignore[arg-type]
+            flaky.extend(outcome["flaky"])  # type: ignore[arg-type]
+            first_pass.extend(outcome["first_pass"])  # type: ignore[arg-type]
+            slow.extend(outcome["slow"])  # type: ignore[arg-type]
+            done += 1
+            for run in runs:  # type: ignore[attr-defined]
+                if not run.ok:
+                    label = "TIMEOUT" if run.timed_out else f"FAIL exit={run.exit_code}"
+                    names = " ".join(run.files)
+                    print(f"\n[runner] {label}: {names}\n{run.log_tail}\n", flush=True)
+            if done % 20 == 0 or done == len(futures):
+                print(f"[runner] {done}/{len(futures)} batches done", flush=True)
+
+    failed_ids = sorted({fid for run in all_runs for fid in run.failed_ids})
+    counts = {"tests": 0, "passed": 0, "failed": 0, "skipped": 0}
+    for run in all_runs:
+        for key in counts:
+            counts[key] += run.counts.get(key, 0)
+    elapsed = time.monotonic() - started
+    report = {
+        "shard": f"{index}/{total}",
+        "file_paths": mine,
+        "suite_files": len(files),
+        "suite_digest": hashlib.sha256("\n".join(files).encode("utf-8")).hexdigest(),
+        "platform": sys.platform,
+        "files": len(mine),
+        "counts": counts,
+        "failed_ids": failed_ids,
+        "flaky_files": sorted(set(flaky)),
+        "timeouts": sorted({f for run in all_runs if run.timed_out for f in run.files}),
+        "elapsed_seconds": round(elapsed, 1),
+    }
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    merge_junit([run.junit for run in all_runs if run.junit], args.junit_out)
+
+    if args.durations_out:
+        fresh: dict[str, float] = {}
+        timed = {*first_pass, *slow}
+        for run in all_runs:
+            for file, secs in run.file_seconds.items():
+                if file in timed:
+                    fresh[file] = round(secs + 1.0, 2)  # + interpreter start-up share
+        payload = json.dumps(fresh, indent=1, sort_keys=True) + "\n"
+        args.durations_out.write_text(payload, encoding="utf-8")
+
+    print(
+        f"[runner] done in {elapsed:.0f}s: {counts['passed']} passed, {counts['failed']} failed, "
+        f"{counts['skipped']} skipped, {len(set(flaky))} flaky files, "
+        f"{len(report['timeouts'])} timed-out files",
+        flush=True,
+    )
+    return 1 if failed_ids else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

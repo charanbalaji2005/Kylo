@@ -1,0 +1,70 @@
+# Supply-chain and workflow security scans.
+#
+# Free scanners for public repositories that write into the repository's
+# Security tab (code scanning), next to CodeQL's default setup. They run on
+# main, weekly and by hand:
+#
+#   zizmor             audits these workflow files themselves: template
+#                      injection, leaked checkout credentials, dangerous
+#                      triggers, cache poisoning. Accepted exceptions live in
+#                      .github/zizmor.yml with their reason.
+#   osv-scanner        scans the shipped lockfiles against osv.dev, so an
+#                      advisory published after a merge still surfaces. It
+#                      reports; it never blocks.
+#
+# The blocking checks live in ci.yml, under the required `CI gate`, so they
+# also run for merge-queue groups: the same zizmor audit on every event, and
+# dependency review (fails when a pull request ADDS a dependency with a known
+# high or critical advisory).
+
+name: Security scans
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * 2" # Tuesdays, off the hour
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  zizmor:
+    name: zizmor (workflow audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: "1.30.1"
+          # Low/informational hints (self-repository syntax, ad-hoc pip in the
+          # merge train) stay local-only instead of filling the Security tab.
+          min-severity: medium
+          config: .github/zizmor.yml
+
+  osv-scanner:
+    name: osv-scanner (lockfiles)
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      # Only what an installed Kylo actually runs.
+      scan-args: |-
+        -L requirements.txt
+        -L kylo/voice_engine/requirements-engine.txt
+        -L scripts/ci/requirements-build.txt
+        -L kylo/ui/web/frontend/package-lock.json
+      fail-on-vuln: false

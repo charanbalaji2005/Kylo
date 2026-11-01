@@ -1,0 +1,444 @@
+# Desktop installers
+
+How Kylo becomes a one-click download, how each installer is built
+and signed, and how an installed copy keeps itself up to date.
+
+This is the maintainer's page. A user never reads it: they press one button on
+the website, run a normal install wizard, and the app updates itself afterwards.
+
+---
+
+## 1. What a release publishes
+
+Every `v*.*.*` tag produces these assets on the GitHub Release. The names are a
+contract - the website's download button and the in-app updater both resolve
+`https://github.com/charanbalaji2005/Kylo/releases/latest/download/<name>`:
+
+| Asset                                  | Platform                                  |
+| -------------------------------------- | ----------------------------------------- |
+| `Kylo-Setup-x64.exe`                | Windows 10/11 x64, per-user Inno Setup    |
+| `Kylo-macOS-arm64.dmg`              | Apple Silicon                             |
+| `Kylo-macOS-x64.dmg`                | Intel Mac                                 |
+| `Kylo-Linux-x86_64.AppImage`        | Linux x86_64                              |
+| `installers-SHA256SUMS.txt`            | what the updater verifies every download against |
+
+Every installer is published a second time, with identical bytes, under its
+earlier name (`PersonalJarvis-Setup-x64.exe`, `PersonalJarvis-macOS-arm64.dmg`,
+`PersonalJarvis-macOS-x64.dmg`, `PersonalJarvis-Linux-x86_64.AppImage`):
+installs from before the rename only look for those. The checksum manifest
+lists both names. Every build, the signed Windows setup included, produces the
+`Kylo-*` file; the earlier name is copied after signing
+(`scripts/ci/installer_aliases.py`). The copies have a planned end and one
+switch, `PUBLISH_EARLIER_INSTALLER_NAMES` in `scripts/ci/release_assets.py`
+(docs/rename/migration-plan.md).
+
+The terminal one-liner and `pipx install kylo` (also published as `personal-jarvis`, its earlier name) stay supported. They
+produce a *managed* or *dev* install, which updates through git - see
+[section 6](#6-how-an-installed-copy-updates-itself).
+
+---
+
+## 2. The frozen bundle
+
+Everything starts from one PyInstaller build:
+
+```bash
+pyinstaller kylo.spec --noconfirm --clean
+```
+
+`onedir`, not `onefile`: no 3-5 second extraction on every launch, and each DLL
+can be signed on its own.
+
+It produces **executables that share one payload**:
+
+| Binary                    | Console? | What it is                                                          |
+| ------------------------- | -------- | ------------------------------------------------------------------- |
+| `KyloApp` (`.exe`)     | no       | the windowed app - Start Menu, Dock, `.desktop`                      |
+| `PersonalJarvis` (`.exe`) | no       | the same windowed app under its earlier name, kept for old pins      |
+| `kylo` (`.exe`)        | yes      | the CLI: `kylo serve`, `kylo --version`, `kylo missions list` |
+| `jarvis` (`.exe`)         | yes      | the same CLI under its earlier name, kept for existing scripts       |
+
+All of them run `kylo/__main__.py`, so the CLI from a native install behaves
+exactly like the pip console script.
+
+> **Why the GUI binary is not called `Jarvis`.** `Jarvis` and `jarvis` are the
+> same path on Windows (NTFS) and on a default macOS APFS volume, so one would
+> silently overwrite the other. `KyloApp` is the name
+> `kylo.core.branding` uses for the Windows branded launcher and the macOS
+> bundle executable; `PersonalJarvis` is their earlier name.
+
+Layout:
+
+- Windows / Linux: `dist/Jarvis/` with the binaries plus `_internal/`
+- macOS: `dist/Kylo.app`, CLI at `Contents/MacOS/kylo` (and
+  `Contents/MacOS/jarvis`)
+
+### Where a frozen install keeps user data
+
+`packaging/pyinstaller_rthook_frozen.py` runs before anything imports `jarvis`
+and points the two documented overrides at the per-user application directory:
+
+- `JARVIS_CONFIG` -> `%LOCALAPPDATA%\Jarvis\jarvis.toml` (`~/.jarvis/jarvis.toml`
+  off Windows), seeded once from the copy inside the bundle
+- `JARVIS_DATA_DIR` -> `<that directory>/data`
+
+Without it, `kylo.core.config` would anchor both to the bundle's own
+directory, where an in-place upgrade overwrites the user's settings and an
+uninstall deletes their memory. An explicitly exported `JARVIS_CONFIG` /
+`JARVIS_DATA_DIR` still wins, so a maintainer can point a frozen build at a
+scratch directory.
+
+---
+
+## 3. Building each installer
+
+All three scripts do the same three things: build the frontend if
+`kylo/ui/web/dist` is missing, run PyInstaller, package the result into
+`dist/installers/`. Each prints the artifact path and exits non-zero on failure.
+
+### Windows
+
+```powershell
+pwsh packaging/windows/build.ps1
+# -> dist/installers/Kylo-Setup-x64.exe
+```
+
+Needs Node 22+, Python 3.12 with `pip install -e ".[desktop,dev]"`, and Inno
+Setup 6 (`winget install --id JRSoftware.InnoSetup -e`). The script finds
+`ISCC.exe` on `PATH`, under `Program Files (x86)`, or in
+`%LOCALAPPDATA%\Programs\Inno Setup 6`.
+
+Two flags shorten the loop: `-SkipPyInstaller` repackages the existing
+`dist/Jarvis` (seconds instead of ~12 minutes) and `-SkipFrontend` refuses to
+run npm.
+
+The wizard itself is `packaging/windows/Kylo.iss`:
+
+- **per-user** (`PrivilegesRequired=lowest`,
+  `{localappdata}\Programs\Kylo`) - no administrator prompt, exactly like Chrome. This is also what
+  lets the in-app updater run the upgrade unattended.
+- a **fixed `AppId` GUID** so every future setup upgrades in place instead of
+  adding a second entry to "Installed apps"
+- Start Menu shortcut; optional desktop shortcut (off by default)
+- optional **"Add the `kylo` command to PATH"** (on by default; the folder
+  it adds also holds `jarvis.exe`, so the earlier name works too). Implemented
+  in `[Code]` against `HKCU\Environment` and broadcast with `WM_SETTINGCHANGE`,
+  so a newly opened terminal sees it without a sign-out. Adding is idempotent,
+  and clearing the task on an upgrade removes the entry again.
+- `CloseApplications=yes` so Restart Manager closes a running Kylo
+  instead of failing on locked files
+- LZMA2/max, `x64compatible` only, `MinVersion=10.0`
+
+### macOS
+
+```bash
+./packaging/macos/build.sh
+# -> dist/installers/Kylo-macOS-<arm64|x64>.dmg
+```
+
+Owned by `packaging/macos/`. It reads `APPLE_CERTIFICATE_P12_BASE64` and
+`APPLE_CERTIFICATE_PASSWORD` (imported into a throw-away keychain before the long
+freeze, so an unusable certificate fails early), `APPLE_SIGNING_IDENTITY`
+(optional: read from the imported certificate when absent), `APPLE_ID`,
+`APPLE_TEAM_ID` and `APPLE_APP_SPECIFIC_PASSWORD`; with none of them set it
+ad-hoc signs, skips notarization and prints a one-line notice. The `.app`'s
+identity (bundle id, minimum system version) comes from the `BUNDLE` block in
+`kylo.spec`. The usage strings macOS shows in its permission dialogs
+(microphone, screen capture, Apple events, the Desktop / Documents / Downloads /
+removable-volume / network-volume folders, local network) come from ONE table,
+`kylo/core/macos_privacy_strings.py`, which `kylo.spec` and the managed
+source-install app both load by path, so the two apps cannot drift apart. The same
+table carries the German and Spanish versions: `kylo.spec` declares the languages
+(`CFBundleLocalizations`) and `build.sh` writes
+`Contents/Resources/{de,es}.lproj/InfoPlist.strings` into the finished `.app`
+(`packaging/macos/add_localizations.py`) BEFORE it signs it, because the files are
+part of the code seal. There
+is deliberately no camera string, no speech-recognition string and no camera
+entitlement: Kylo has no caller for either. The entitlements embedded by the
+Developer ID path live in `packaging/macos/entitlements.plist` (no comments; the
+reasoning is in `packaging/macos/README.md`).
+
+Several things in that block are easy to get wrong and invisible to a headless
+smoke run, so the macOS job checks the finished bundle
+(`python scripts/ci/check_frozen_macos_app.py --app "dist/Kylo.app"`):
+
+- `LSBackgroundOnly` must be `False`. PyInstaller sets it to true whenever the
+  last executable of the bundle is a console one (the `jarvis` CLI is), and
+  LaunchServices then treats the app as having no Dock icon and no windows.
+- The pyobjc frameworks the permission code loads by name (`AVFoundation`
+  above all) must be in the frozen archive. That needs the `desktop-macos` extra
+  on the build machine; the macOS job installs it.
+- Every usage string of the table must be in `Info.plist` with exactly that
+  text, and the removed keys must not be.
+- The bundle must declare its German and Spanish localisation, and each
+  `{de,es}.lproj/InfoPlist.strings` must exist with exactly the text of the table.
+- On a signed build, `codesign -d --entitlements :-` must report every
+  entitlement of `entitlements.plist` and not the camera one. An ad-hoc or
+  unsigned build embeds no entitlements, so the check skips itself with a NOTE
+  line; that is a skip, not a pass, and the hardened-runtime behaviour of a
+  signed build has never been run on a Mac (unverified).
+
+The frozen smoke boots the app twice and, on macOS, also reads its permission
+status each time: a microphone row that reads "unavailable" means the framework
+did not load inside the app (the check above only sees that the module is in the
+archive). The v2.5.0 image shipped with the first two defects (BUG-222).
+
+**Permission prompts.** Kylo asks for a macOS permission at the moment
+a feature you start needs it (the first dictation asks for the microphone, the
+first screen capture for Screen Recording, and so on) and never at launch;
+nothing is requested up front and no banner or wizard nags. Apple's own dialog or
+System Settings pane does the asking and the app draws nothing around it. Declining
+a permission degrades that one feature and leaves the rest of the app working; the
+app then shows one short toast with one click to the right System Settings pane.
+The dialog text is German and Spanish on a German or Spanish Mac (the build writes
+the `.lproj` strings before signing). `kylo permissions reset <permission>` makes
+macOS ask again. This is the designed behaviour; it has not been exercised on a real
+Mac yet (unverified). The
+downloaded app and the managed source-install app are separate apps to macOS
+(`ai.personaljarvis.desktop` and `com.personal-jarvis.desktop`) and each keeps its
+own grants.
+
+### Linux
+
+```bash
+./packaging/linux/build.sh
+# -> dist/installers/Kylo-Linux-x86_64.AppImage
+```
+
+Owned by `packaging/linux/`. Built on the oldest supported runner
+(`ubuntu-22.04`) because an AppImage inherits the glibc of the machine that
+built it.
+
+---
+
+## 4. Signing
+
+Signing is optional everywhere. Without secrets the build still produces a
+working installer and says, in one line, that it is unsigned.
+
+| Platform | Mechanism                    | Secrets                                                                                                     |
+| -------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Windows  | SignPath Foundation (preferred) | secret `SIGNPATH_API_TOKEN`; variables `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` (optional `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`) |
+| Windows  | Azure Trusted Signing (alternative) | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_SIGNING_ENDPOINT`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CERTIFICATE_PROFILE` |
+| macOS    | Developer ID + notarization  | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD` (and optionally `APPLE_SIGNING_IDENTITY`; `build.sh` reads it from the imported certificate) |
+| Linux    | none (AppImage is unsigned)  | -                                                                                                             |
+
+Private key material only ever exists as a GitHub Actions secret (AP-29); no
+signing step ever reads a file from the repository.
+
+Without the macOS secrets the published `.dmg` is ad-hoc signed and not
+notarized: macOS blocks the first launch (System Settings > Privacy & Security >
+Open Anyway) and treats every update as a new app, so every permission is asked
+for again. `packaging/macos/build.sh` is written to import the certificate into
+a temporary keychain on the runner and read the signing identity from it; that
+step has been rehearsed (`DRY_RUN`) and run against a stand-in `security`
+command, but not yet against a real keychain or with an Apple account.
+`packaging/macos/README.md` lists how to obtain the certificate.
+
+A run started by hand from a branch (`workflow_dispatch`) builds the installers
+without publishing a release, which is the way to try the macOS job, its
+certificate import and the app probe before tagging.
+
+The Windows SignPath path and its team roles are described in
+[`code-signing-policy.md`](code-signing-policy.md). The workflow uploads the
+unsigned setup as a workflow artifact, waits up to an hour for the manual
+approval in SignPath, then refuses the signed file unless
+`Get-AuthenticodeSignature` reports a valid, timestamped signature issued to
+SignPath Foundation. When both SignPath and Azure are configured, SignPath
+is used.
+
+On Windows the workflow signs the **setup executable**. That is the file the
+browser marks with Mark-of-the-Web, so it is the signature SmartScreen weighs;
+files the installer then writes carry no MOTW of their own. Signing the inner
+binaries as well (run PyInstaller, sign `dist/Jarvis`, then
+`build.ps1 -SkipPyInstaller`) mainly helps against antivirus false positives on
+PyInstaller bootloaders, and can be added the same way.
+
+---
+
+## 5. Releasing
+
+`.github/workflows/desktop-installers.yml` runs on a `v*.*.*` tag push (or
+manually via `workflow_dispatch`):
+
+1. `windows`, `macos` (arm64 + x64) and `linux` each install Python 3.12 and
+   Node 22, `pip install -e ".[desktop,dev]"` (macOS adds `desktop-macos`), run
+   their OS build script and upload the artifact. The macOS jobs also read the
+   finished `.app` with `scripts/ci/check_frozen_macos_app.py` before the
+   headless smoke test.
+2. `checksums` downloads all of them, refuses to continue if any promised
+   asset is missing, and writes `installers-SHA256SUMS.txt` (plain `sha256sum`
+   format, flat file names), re-verified with `sha256sum -c`.
+3. `sign-update-manifest` (tag runs only, `release-signing` environment) writes
+   `installers-update-manifest.json` - the release version, its tag and the
+   SHA-256 of `installers-SHA256SUMS.txt` - and signs it with the
+   offline-ceremony Ed25519 key (`WAVE2_OFFLINE_KEY_B64`) into
+   `installers-update-manifest.json.sig`, then verifies the signature against
+   `install/keys/offline-ceremony.pub`. A missing key fails the release.
+4. `release` verifies the tag equals `kylo.__version__`, re-checks every
+   installer against the checksum manifest and the checksum manifest against
+   the signed one, and attaches everything to the Release.
+
+`contents: write` is granted to that last job only; the signing job holds a
+read-only token and is the only job that can read the key.
+
+The version check matters twice over: a tag that disagrees with
+`kylo.__version__` publishes installers nobody can trace back to a commit, and
+the updater compares the release version against `kylo.__version__` - so a
+mismatch would offer an update that installs the same build forever.
+
+---
+
+## 6. How an installed copy updates itself
+
+`GET /api/update/status` and `POST /api/update/apply` serve all install kinds
+behind one "Update Now" button. `kylo.core.frozen.is_frozen()` is the only
+switch between them.
+
+| Kind        | Detected by                          | Update path                                    |
+| ----------- | ------------------------------------ | ---------------------------------------------- |
+| **frozen**  | `sys.frozen` + `sys._MEIPASS`        | download the next installer asset, verify, install |
+| **managed** | install marker + official `origin`   | `git fetch` the published tag, reinstall       |
+| **dev**     | anything else                        | never updates                                  |
+
+For a frozen install (`kylo/core/installer_update.py`):
+
+1. **Pick the asset.** OS plus CPU architecture map to one row of
+   `INSTALLER_ASSET_NAMES` in `kylo/core/installer_update.py`: the name from
+   the table in section 1, and the same file under its earlier
+   `PersonalJarvis-` name. The updater takes the first accepted name a release
+   carries; when a release carries more than one, the first that
+   `installers-SHA256SUMS.txt` lists. No
+   mapping (Windows on ARM, Linux on aarch64) means the button never appears.
+2. **Refuse to offer what cannot be installed.** `status` reports
+   `update_available: true` only when the release actually carries both this
+   platform's installer, `installers-SHA256SUMS.txt` and the signed update
+   manifest (`installers-update-manifest.json` plus `.sig`). Status is
+   fail-open: any network error reports "no update", never an error.
+3. **Verify the signature.** Before any installer byte is fetched, `apply`
+   checks the Ed25519 signature over `installers-update-manifest.json` against
+   the release key pinned in `kylo/core/update_manifest.py` (the same key as
+   `install/keys/offline-ceremony.pub`), that the signed version equals the
+   release being installed (a replayed older release is refused), and that the
+   signed SHA-256 equals that of the release's `installers-SHA256SUMS.txt`. A
+   release without the signed manifest is not offered and not installed.
+4. **Verify before executing.** `apply` downloads to a temp directory under a
+   size cap, computes SHA-256 and compares it against the manifest **of the same
+   release**. A mismatch, a missing entry, an oversized body or an unreachable
+   manifest all delete the download and refuse. Apply is fail-closed.
+5. **Hand over to the platform.**
+   - Windows: runs the new `Setup.exe` detached with
+     `/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART`. Restart
+     Manager closes the app, the files are replaced, the app comes back.
+   - macOS: `hdiutil attach` the DMG, swap the running `.app` with two renames
+     on one filesystem (the old bundle is put back if the second rename fails),
+     `hdiutil detach`, relaunch with `open`. The swap is in place whenever the
+     disk image carries the app under the running bundle's name or under the
+     name this version ships with, so a bundle the user renamed or duplicated
+     in Finder is updated where it is. Only a disk image whose bundle has a
+     name this version has never used counts as a renamed app: it is installed
+     beside the running bundle under its own name and relaunched from there.
+     The superseded bundle is removed only after that copy is complete and
+     only when its `CFBundleIdentifier` is one of ours; an unrelated app that
+     already has the new name is never overwritten.
+   - Linux: copy the new AppImage next to the running one, `chmod +x`,
+     `os.replace` onto `$APPIMAGE` (atomic), relaunch.
+
+The response says `restart_required: false`, because the handover restarts the
+app itself. A caller that restarts anyway is harmless - the single-instance lock
+still holds - but the honest answer is "no restart needed from you".
+
+Managed installs keep today's behaviour untouched: the frozen branch is entered
+only when `is_frozen()` is true, and the frozen branch never runs git.
+
+A managed update is applied by the restart helper of the version that is being
+replaced: it resets the checkout to the new revision, runs that revision's
+installer, verifies its UI bundle and starts it. The helper does not assume the
+new tree looks like its own. Each release states where it keeps its UI bundle,
+launcher module, version file, config file and macOS app bundle (name and
+bundle identifier) in
+`install/update-contract.json` (reader: `kylo/core/update_contract.py`), and
+the helper reads the contract of whichever tree is checked out at that moment -
+the target after the reset, the previous one after a rollback. A tree without
+the file, or with one that fails validation (unknown schema, a path that leaves
+the checkout), is treated as using the default locations, so a wrong contract
+fails the bundle check and rolls back. A contract may name a `rollback_hook`: a
+tracked script of the new release that runs when its install failed, before
+the checkout returns to the previous revision.
+
+Re-running the one-line installer over an existing install downloads first
+(a fetch only writes inside `.git`), then stops every app running out of that
+install right before it resets the checkout, and again before it rebuilds the
+environment. A failed download therefore leaves the app running. The path that
+moves a broken install aside asks the download server first (`git ls-remote`,
+then a plain HTTPS request for the hosted repository, because the archive
+download still works where git is blocked) and changes nothing while it is out
+of reach. Started from a terminal inside the app, the installer
+refuses before it stops anything: its own parent processes run out of the
+install's environment, so stopping the app would end the installer with it.
+
+Known limits of the update contract. These names are not part of it, so a
+release that changes one has to keep the old one working for the update that
+crosses it:
+
+- the Windows launcher copy the desktop app runs as
+  (`WINDOWS_BRANDED_LAUNCHER_FILE_NAME`) and its one-process loop guard, the
+  environment variable `JARVIS_BRANDED_LAUNCH`
+  (`WINDOWS_BRANDED_LAUNCH_ENV_VAR`). The helper starts the new launcher
+  module through the old copy when one still exists, otherwise through the
+  interpreter;
+- the launcher module written into autostart entries and shortcuts
+  (`LAUNCHER_MODULE` in `kylo/autostart/command.py`, `_LAUNCHER_MODULE` in
+  `kylo/ui/icon_utils.py`). The helper rewrites neither: shortcuts are
+  renewed by the installer of the new release, the autostart entry by the new
+  app when it first starts;
+- processes of the old version that outlive the app window, such as the
+  terminal host (`kylo.terminal.pty_host`), which keeps running the old code
+  until it is stopped. The helper waits for the app process only.
+
+---
+
+## 7. What an uninstall keeps
+
+The Windows uninstaller removes the **program directory only**
+(`%LOCALAPPDATA%\Programs\Kylo`, or `%LOCALAPPDATA%\Programs\Personal Jarvis`
+for an install upgraded from before the rename) and its PATH entry, Start Menu
+shortcut and uninstall registry key.
+
+It deliberately keeps **`%LOCALAPPDATA%\Jarvis`** - `jarvis.toml`, memory,
+skills, logs, the chat database. Uninstalling and reinstalling therefore returns
+the user to their own configured app, not to a blank one. The uninstall
+confirmation says so. To remove that too, delete the directory by hand or run
+`kylo --uninstall` before uninstalling.
+
+API keys are not in that directory: they live in the OS credential store
+(Windows Credential Manager / Keychain / Secret Service) and survive both.
+
+---
+
+## 8. Verifying a build by hand
+
+```bash
+# the CLI works from the bundle
+dist/Jarvis/kylo.exe --version
+
+# the backend really boots (Ctrl-C to stop)
+dist/Jarvis/kylo.exe serve
+curl http://127.0.0.1:<admin_api_port>/api/health
+
+# a full install / upgrade / uninstall cycle, unattended
+Kylo-Setup-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\pj-test" /LOG=install.log
+C:\pj-test\kylo.exe --version
+Kylo-Setup-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="C:\pj-test"   # upgrade in place
+C:\pj-test\unins000.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+Use a **short** test directory. The deepest path in the bundle is about 111
+characters; a real install prefix adds roughly 60, which fits inside Windows'
+260-character limit with room to spare, but a deeply nested scratch directory
+does not, and Inno then aborts with `MoveFile failed; code 3`.
+
+Never run the app out of `dist/Jarvis` and then package that directory: the app
+writes runtime state into it, which would ship the builder's own database inside
+the installer. `build.ps1` removes such leftovers before packaging, and a clean
+`--clean` build never has them.

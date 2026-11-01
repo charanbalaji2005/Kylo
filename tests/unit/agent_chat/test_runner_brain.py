@@ -1,0 +1,463 @@
+"""The Jarvis surface's brain runner — a whole typed turn through the service.
+
+A fake BrainManager (tests/fakes/fake_brain_manager.py) stands in for the
+harness; everything else is real: the store, the service, the event log, the
+app bus, the step mirror and the approval bridge.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from kylo.agent_chat import runner_api, runner_brain
+from kylo.agent_chat.events import make_event
+from kylo.agent_chat.service import AgentChatService
+from kylo.agent_chat.store import AgentChatStore
+from kylo.core.bus import EventBus
+from kylo.core.protocols import BrainDelta
+from tests.fakes.fake_brain_manager import FakeBrainManager
+
+
+async def _drain(q: asyncio.Queue, until_kind: str, wait_s: float = 5.0) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    async with asyncio.timeout(wait_s):
+        while True:
+            ev = await q.get()
+            out.append(ev)
+            if ev["kind"] == until_kind:
+                return out
+
+
+def _service(bus: EventBus | None) -> AgentChatService:
+    return AgentChatService(
+        AgentChatStore(":memory:"), assistant_name=lambda: "Testo", bus=lambda: bus
+    )
+
+
+def _jarvis_session(svc: AgentChatService, tmp_path: Path, **over: Any):
+    kwargs: dict[str, Any] = {
+        "provider": "openai",
+        "model": "gpt-x",
+        "effort": "high",
+        "cwd": str(tmp_path),
+        "permission_mode": "ask",
+        "surface": "jarvis",
+    }
+    kwargs.update(over)
+    return svc.create_session(**kwargs)
+
+
+@pytest.fixture
+def no_cli(monkeypatch: pytest.MonkeyPatch):
+    from kylo.agent_chat import service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "_claude_cli_installed", lambda: False)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "expected_runner"),
+    [("ollama", "local-model", "brain"), ("openai-codex", "codex-model", "codex-cli")],
+)
+async def test_chat_pick_survives_a_different_global_worker(
+    tmp_path, monkeypatch, provider, model, expected_runner
+):
+    from kylo.agent_chat import service as svc_mod
+    from kylo.core import runtime_refs, task_agent
+
+    global_manager = SimpleNamespace(
+        _config=SimpleNamespace(brain=SimpleNamespace(worker=SimpleNamespace(
+            provider="claude-api", model="other-model", reasoning_effort="high"
+        )))
+    )
+    monkeypatch.setattr(runtime_refs, "get_brain_manager", lambda: global_manager)
+    probed = []
+
+    async def seat(selected):
+        probed.append(selected)
+        return None
+
+    monkeypatch.setattr(task_agent, "subscription_seat_off_loop", seat)
+    calls = []
+
+    async def run(handle, text, runner="brain", **kwargs):
+        calls.append((handle.session.provider, handle.session.model, runner))
+        await handle.emit(make_event("turn_finished", {
+            "turn_id": handle.turn_id, "status": "done", "usage": {},
+        }))
+
+    monkeypatch.setattr(svc_mod, "run_brain_turn", run)
+    monkeypatch.setattr(svc_mod, "run_cli_turn", run)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path, provider=provider, model=model, effort="")
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "hi")
+    events = await _drain(q, "turn_finished")
+    assert calls == [(provider, model, expected_runner)]
+    assert probed == [provider]
+    assert svc.store.get_session(session.session_id).provider == provider
+    started = next(e for e in events if e["kind"] == "turn_started")["payload"]
+    assert started["provider"] == provider
+
+
+async def test_a_jarvis_turn_runs_on_the_brain_with_the_sessions_pick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    bus = EventBus()
+    fake = FakeBrainManager(bus=bus, tool=("open-app", {"name": "Notes"}))
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    monkeypatch.setattr(runner_brain, "_agent_secret", lambda _r, _p: "k-agent")
+    svc = _service(bus)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+
+    turn_id = await svc.send(session.session_id, "Open my notes please")
+    events = await _drain(q, "turn_finished")
+    kinds = [e["kind"] for e in events]
+
+    started = next(e for e in events if e["kind"] == "turn_started")["payload"]
+    assert started["runner"] == "brain" and started["surface"] == "jarvis"
+    assert "reasoning_started" in kinds
+    assert [e["payload"]["text"] for e in events if e["kind"] == "text_delta"] == [
+        "Hello ",
+        "from ",
+        "Jarvis",
+    ], "deltas are chunks, not the text so far"
+    assert "reasoning_delta" in kinds and "tool_call" in kinds and "tool_result" in kinds
+    call = next(e for e in events if e["kind"] == "tool_call")["payload"]
+    result = next(e for e in events if e["kind"] == "tool_result")["payload"]
+    assert call["name"] == "open-app" and call["input"] == {"name": "Notes"}
+    assert result["call_id"] == call["call_id"] and result["output"] == "looked"
+    final = next(e for e in events if e["kind"] == "assistant_text")["payload"]
+    assert final["text"] == "Hello from Jarvis"
+    finished = events[-1]["payload"]
+    assert finished["turn_id"] == turn_id and finished["status"] == "done"
+    assert finished["usage"] == {"input_tokens": 12, "output_tokens": 4, "cost_usd": 0.002}
+
+    # The one generate call carried the pick — and nothing moved the live brain.
+    text, kw = fake.calls[0]
+    assert text == "Open my notes please"
+    override = kw["turn_override"]
+    assert override.provider == "openai" and override.model == "gpt-x"
+    assert override.reasoning_effort == "high"
+    assert kw["use_history"] is False and kw["publish_response"] is False
+    assert kw["allow_voice_confirm"] is False and kw["emit_tool_ack"] is False
+    assert kw["source_layer"] == runner_brain.SOURCE_LAYER
+    assert kw["conversation_id"] == session.session_id
+    assert set(override.tools_extra) == {
+        "Read",
+        "Write",
+        "Edit",
+        "Ls",
+        "Glob",
+        "Grep",
+        "RunCommand",
+    }
+    assert override.tool_context["approval_surface"] == "interactive"
+    assert override.tool_context["approval_ref"] == f"agent-chat:{session.session_id}"
+    assert override.tool_context["cwd"] == str(tmp_path)
+    assert override.tool_context["delivery"] == "written"
+    assert fake.seen_key == "k-agent", "the Agents-tab key was the turn's credential"
+    assert not svc.is_running(session.session_id)
+
+
+async def test_history_is_the_sessions_own_log_in_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    fake = FakeBrainManager(reply="second")
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    sid = session.session_id
+    svc.store.append_event(sid, make_event("user_message", {"text": "first question"}))
+    svc.store.append_event(sid, make_event("turn_started", {"turn_id": "t0"}))
+    svc.store.append_event(
+        sid,
+        make_event(
+            "tool_call",
+            {"turn_id": "t0", "call_id": "c1", "name": "Read", "input": {"file_path": "a.py"}},
+        ),
+    )
+    svc.store.append_event(
+        sid,
+        make_event(
+            "tool_result",
+            {"turn_id": "t0", "call_id": "c1", "output": "print(1)", "is_error": False},
+        ),
+    )
+    svc.store.append_event(
+        sid, make_event("assistant_text", {"turn_id": "t0", "text": "It prints 1."})
+    )
+    svc.store.append_event(sid, make_event("turn_finished", {"turn_id": "t0", "status": "done"}))
+    q = svc.subscribe(sid)
+
+    await svc.send(sid, "and now?")
+    await _drain(q, "turn_finished")
+
+    _, kw = fake.calls[0]
+    history = kw["history_override"]
+    assert [m.role for m in history] == ["user", "assistant"]
+    assert history[0].content == "first question"
+    assert "[used tool" not in history[1].content, "no imitable call marker (#978)"
+    assert "Tool record of this turn" in history[1].content
+    assert "- Read (a.py) returned: print(1)" in history[1].content
+    assert history[1].content.endswith("It prints 1.")
+    assert all(isinstance(m.content, str) for m in history), "prose only, no foreign tool ids"
+
+
+async def test_plan_stance_offers_reading_hands_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path, permission_mode="plan")
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "what is in here?")
+    await _drain(q, "turn_finished")
+    override = fake.calls[0][1]["turn_override"]
+    assert set(override.tools_extra) == {"Read", "Ls", "Glob", "Grep"}
+    assert override.tool_filter is not None
+
+
+async def test_cancel_ends_a_running_brain_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    hold = asyncio.Event()
+    fake = FakeBrainManager(hold=hold)
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "take your time")
+    await _drain(q, "reasoning_started")
+    assert await svc.cancel(session.session_id)
+    events = await _drain(q, "turn_finished")
+    assert events[-1]["payload"]["status"] == "cancelled"
+    assert not svc.is_running(session.session_id)
+
+
+async def test_a_brain_error_ends_the_turn_honestly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    fake = FakeBrainManager(fail=RuntimeError("provider down"))
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "hi")
+    events = await _drain(q, "turn_finished")
+    finished = events[-1]["payload"]
+    assert finished["status"] == "error" and "provider down" in (finished["error"] or "")
+
+
+@pytest.mark.parametrize("reason", ["mandated_tool_unfulfilled", "unbacked_action_claim"])
+async def test_guarded_reply_is_visible_but_never_finishes_as_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli, reason
+):
+    safe_reply = "The requested action has not been completed."
+    fake = FakeBrainManager(reply=safe_reply, chunks=())
+    original_generate = fake.generate
+
+    async def guarded_generate(text, **kwargs):
+        reply = await original_generate(text, **kwargs)
+        kwargs["turn_override"].receipt.mark_guard_failure(reason)
+        return reply
+
+    monkeypatch.setattr(fake, "generate", guarded_generate)
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    queue = svc.subscribe(session.session_id)
+    try:
+        await svc.send(session.session_id, "Create a folder named drafts.")
+        events = await _drain(queue, "turn_finished")
+        final = next(event["payload"] for event in events if event["kind"] == "assistant_text")
+        assert final["text"] == safe_reply
+        terminal = events[-1]["payload"]
+        assert terminal["status"] == "error" and terminal["error"] == reason
+        assert terminal["usage"] == {"input_tokens": 12, "output_tokens": 4, "cost_usd": 0.002}
+        saved = svc.store.list_events(session.session_id)
+        saved_terminal = next(
+            event["payload"] for event in saved if event["kind"] == "turn_finished"
+        )
+        assert saved_terminal["status"] == "error"
+    finally:
+        svc.unsubscribe(session.session_id, queue)
+        await svc.wait_turn(session.session_id)
+        svc.store.close()
+
+
+async def test_no_brain_yet_is_a_clear_error_not_a_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: None)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "hi")
+    events = await _drain(q, "turn_finished")
+    assert events[-1]["payload"]["status"] == "error"
+    assert "starting up" in events[-1]["payload"]["error"]
+
+
+async def test_the_agent_surface_still_runs_the_api_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    """A coding-agent session never reaches the brain runner."""
+    async def complete(request):
+        yield BrainDelta(content="API runner reply")
+
+    monkeypatch.setattr(
+        runner_api, "build_brain", lambda *args: SimpleNamespace(complete=complete),
+    )
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = svc.create_session(
+        provider="openai", model="m", effort="high", cwd=str(tmp_path), surface="agent"
+    )
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "hi")
+    events = await _drain(q, "turn_finished")
+    started = next(e for e in events if e["kind"] == "turn_started")["payload"]
+    assert started["runner"] == "api" and started["surface"] == "agent"
+    assert fake.calls == []
+
+
+def test_step_mirror_ignores_another_turns_events():
+    async def scenario() -> None:
+        import uuid
+
+        from kylo.core.events import ActionExecuted, ActionProposed
+
+        bus = EventBus()
+        mine, theirs = uuid.uuid4(), uuid.uuid4()
+        rows: list[tuple[str, dict[str, Any]]] = []
+
+        async def emit(kind: str, payload: dict[str, Any]) -> None:
+            rows.append((kind, payload))
+
+        mirror = runner_brain._StepMirror(emit, "turn-1", bus, mine)
+        mirror.start()
+        await bus.publish(ActionProposed(trace_id=theirs, tool_name="voice-tool", args={}))
+        await bus.publish(ActionProposed(trace_id=mine, tool_name="Read", args={"file_path": "x"}))
+        assert mirror.open_call_id("Read") and not mirror.open_call_id("voice-tool")
+        await bus.publish(ActionExecuted(trace_id=theirs, tool_name="voice-tool", success=True))
+        await bus.publish(ActionExecuted(trace_id=mine, tool_name="Read", success=True))
+        mirror.stop()
+        assert [k for k, _ in rows] == ["tool_call", "tool_result"]
+        assert rows[0][1]["name"] == "Read"
+
+    asyncio.run(scenario())
+
+
+# -- composed prompts and background work (ADR-0041) ---------------------------
+
+
+async def test_a_continuation_is_briefing_not_the_persons_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    """The brain reads a turn's text to decide which coding pane an order
+    addresses. A continuation quotes the original order and the agents'
+    reports, so as the turn's text it would send that order to the pane again."""
+    from kylo.agent_chat.delegation_wait import CONTINUE_TURN, continuation_prompt
+
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    original = "Tell Kai to fix the login bug."
+    prompt = continuation_prompt(
+        [{"status": "completed", "report": "Kai fixed it.", "agent": "Kai"}], original, later=True
+    )
+
+    await svc.send(session.session_id, prompt, display_text=original, background_result=True)
+    await _drain(q, "turn_finished")
+
+    text, kw = fake.calls[0]
+    assert text == CONTINUE_TURN and "Kai" not in text
+    briefing = kw["turn_override"].system_extra
+    assert "Kai fixed it." in briefing and original in briefing
+    # Tools that check a call against the person's request still see it.
+    assert kw["turn_override"].tool_context["person_request"] == original
+    assert kw["force_output_language"] == "en"  # the request's language, resolved once
+
+
+async def test_a_continuation_keeps_a_turkish_conversation_turkish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    """Forensic 2026-10-19: the neutral English continue line flipped a Turkish
+    chat to English on every delegated result. The turn is pinned to the
+    request's language and the brain reads its language from the request."""
+    from kylo.agent_chat.delegation_wait import CONTINUE_TURN, continuation_prompt
+
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    original = "Kai'ye giriş hatasını düzeltmesini söyle lütfen."  # i18n-allow
+    prompt = continuation_prompt(
+        [{"status": "failed", "report": "Kai could not finish.", "agent": "Kai"}],
+        original,
+        later=True,
+    )
+
+    await svc.send(session.session_id, prompt, display_text=original, background_result=True)
+    await _drain(q, "turn_finished")
+
+    text, kw = fake.calls[0]
+    assert text == CONTINUE_TURN
+    assert kw["force_output_language"] == "tr"
+    assert kw["language_text"] == original
+
+
+async def test_an_ordinary_turn_names_no_separate_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+    await svc.send(session.session_id, "Open my notes please")
+    await _drain(q, "turn_finished")
+    _, kw = fake.calls[0]
+    assert "person_request" not in kw["turn_override"].tool_context
+
+
+async def test_a_turn_is_briefed_on_requests_still_running_behind_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_cli
+):
+    from kylo.agent_chat.delegation_wait import DelegationWait
+    from kylo.agent_chat.parked_work import ParkedWork
+    from kylo.core.delegated_work import DelegatedWork
+
+    fake = FakeBrainManager()
+    monkeypatch.setattr(runner_brain, "brain_manager", lambda: fake)
+    svc = _service(None)
+    session = _jarvis_session(svc, tmp_path)
+    q = svc.subscribe(session.session_id)
+
+    async def still_working():
+        return None
+
+    gate = DelegationWait(SimpleNamespace(turn_id="t0"))
+    gate.add(DelegatedWork("pane", "Kai", still_working))
+    svc.parked_work._parked[session.session_id] = [
+        ParkedWork("t0", "Tell Kai to fix the login bug.", "Tell Kai to fix the login bug.", gate)
+    ]
+
+    await svc.send(session.session_id, "What is the weather tomorrow?")
+    await _drain(q, "turn_finished")
+
+    text, kw = fake.calls[0]
+    assert text == "What is the weather tomorrow?"  # the person's words, nothing added
+    briefing = kw["turn_override"].system_extra
+    assert "Tell Kai to fix the login bug." in briefing and "do not wait for it" in briefing

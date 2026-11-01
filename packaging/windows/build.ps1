@@ -1,0 +1,225 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Build the Windows installer for Personal Jarvis.
+
+.DESCRIPTION
+    One command from a clean checkout to a shippable installer:
+
+        1. build the React frontend when kylo/ui/web/dist is missing,
+        2. freeze the app with PyInstaller (kylo.spec, onedir),
+        3. wrap dist/Jarvis in an Inno Setup wizard.
+
+    The result is dist/installers/Kylo-Setup-x64.exe - the name the
+    SignPath artifact configuration pins (docs/code-signing-policy.md). A
+    release signs it under that name and then publishes it twice with identical
+    bytes: as Kylo-Setup-x64.exe and as PersonalJarvis-Setup-x64.exe, the
+    name installs from before the rename look for
+    (scripts/ci/installer_aliases.py).
+
+    Every failure stops the script with a non-zero exit code; nothing is left
+    half-built and reported as success.
+
+.PARAMETER Python
+    Interpreter to freeze with. Defaults to the repository's .venv, then to
+    whatever `python` resolves to.
+
+.PARAMETER SkipFrontend
+    Never run npm, even when kylo/ui/web/dist is missing. For a CI job that
+    built the bundle in an earlier step.
+
+.PARAMETER SkipPyInstaller
+    Package the existing dist/Jarvis instead of freezing again. Cuts the
+    edit-compile loop on the .iss file from minutes to seconds.
+
+.EXAMPLE
+    pwsh packaging/windows/build.ps1
+#>
+[CmdletBinding()]
+param(
+    [string] $Python = "",
+    [switch] $SkipFrontend,
+    [switch] $SkipPyInstaller
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Write-Step {
+    param([string] $Message)
+    Write-Host "[build] $Message"
+}
+
+function Stop-WithError {
+    param([string] $Message)
+    Write-Host "[build] FAILED: $Message" -ForegroundColor Red
+    exit 1
+}
+
+function Invoke-Checked {
+    param(
+        [string] $Executable,
+        [string[]] $Arguments,
+        [string] $WorkingDirectory,
+        [string] $What
+    )
+    Push-Location $WorkingDirectory
+    try {
+        & $Executable @Arguments
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($code -ne 0) {
+        Stop-WithError "$What exited with code $code"
+    }
+}
+
+# --- Locate the repository -------------------------------------------------
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$SpecFile = Join-Path $RepoRoot "kylo.spec"
+$BundleDir = Join-Path $RepoRoot "dist\Jarvis"
+$InstallerDir = Join-Path $RepoRoot "dist\installers"
+$FrontendDir = Join-Path $RepoRoot "kylo\ui\web\frontend"
+$FrontendDist = Join-Path $RepoRoot "kylo\ui\web\dist"
+$IssFile = Join-Path $PSScriptRoot "Kylo.iss"
+$IconFile = Join-Path $RepoRoot "assets\icons\kylo.ico"
+
+if (-not (Test-Path $SpecFile)) { Stop-WithError "kylo.spec not found at $SpecFile" }
+if (-not (Test-Path $IssFile)) { Stop-WithError "Kylo.iss not found at $IssFile" }
+
+# --- Version ---------------------------------------------------------------
+# Single source of truth. A hand-typed version here would drift from the tag
+# the release workflow verifies against.
+$InitFile = Join-Path $RepoRoot "kylo\__init__.py"
+$InitText = Get-Content -Raw -Encoding UTF8 $InitFile
+$VersionMatch = [regex]::Match($InitText, '__version__\s*=\s*"([^"]+)"')
+if (-not $VersionMatch.Success) { Stop-WithError "kylo/__init__.py does not define __version__" }
+$AppVersion = $VersionMatch.Groups[1].Value
+Write-Step "Personal Jarvis $AppVersion"
+
+# --- Python ----------------------------------------------------------------
+if ($Python -eq "") {
+    $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+    if (Test-Path $VenvPython) { $Python = $VenvPython } else { $Python = "python" }
+}
+Write-Step "interpreter: $Python"
+
+# --- 1. Frontend -----------------------------------------------------------
+if (Test-Path (Join-Path $FrontendDist "index.html")) {
+    Write-Step "1/3 frontend bundle already present - skipping npm"
+} elseif ($SkipFrontend) {
+    Stop-WithError "kylo/ui/web/dist is missing and -SkipFrontend was passed"
+} else {
+    Write-Step "1/3 building the frontend"
+    if (-not (Test-Path (Join-Path $FrontendDir "node_modules"))) {
+        Invoke-Checked -Executable "npm" -Arguments @("ci") -WorkingDirectory $FrontendDir -What "npm ci"
+    }
+    Invoke-Checked -Executable "npm" -Arguments @("run", "build") -WorkingDirectory $FrontendDir -What "npm run build"
+    if (-not (Test-Path (Join-Path $FrontendDist "index.html"))) {
+        Stop-WithError "npm run build did not produce kylo/ui/web/dist/index.html"
+    }
+}
+
+# --- 2. PyInstaller --------------------------------------------------------
+# kylo.spec bundles ./jarvis.toml unconditionally, and that file is
+# .gitignore'd - a fresh clone (every CI runner) does not have one and
+# PyInstaller aborts before it starts with "Unable to find ... jarvis.toml".
+# Seed the shipped default so the build works from a clean checkout. On a
+# machine that already has a live config the spec bundles THAT file as-is,
+# which is a privacy question the build cannot answer for the maintainer, so
+# it says so instead of quietly shipping it.
+#
+# packaging/macos/build.sh and packaging/linux/build.sh have done this since
+# they were written; this script did not, which is why the first CI run
+# produced a DMG and an AppImage and no .exe.
+$ConfigFile = Join-Path $RepoRoot "jarvis.toml"
+$ConfigExample = Join-Path $RepoRoot "kylo.toml.example"
+if (-not (Test-Path $ConfigFile)) {
+    if (-not (Test-Path $ConfigExample)) {
+        Stop-WithError "neither jarvis.toml nor kylo.toml.example exists; kylo.spec cannot bundle a default configuration"
+    }
+    Write-Step "seeding jarvis.toml from kylo.toml.example (clean checkout)"
+    Copy-Item -LiteralPath $ConfigExample -Destination $ConfigFile
+} elseif ((Test-Path $ConfigExample) -and
+          ((Get-FileHash -LiteralPath $ConfigFile).Hash -ne (Get-FileHash -LiteralPath $ConfigExample).Hash)) {
+    Write-Step "WARNING: kylo.spec bundles this machine's jarvis.toml into the installer, and it differs from kylo.toml.example. Check it carries nothing personal before publishing the build."
+}
+
+if ($SkipPyInstaller) {
+    Write-Step "2/3 reusing the existing bundle (-SkipPyInstaller)"
+} else {
+    Write-Step "2/3 freezing with PyInstaller"
+    Invoke-Checked -Executable $Python `
+        -Arguments @("-m", "PyInstaller", "kylo.spec", "--noconfirm", "--clean") `
+        -WorkingDirectory $RepoRoot -What "pyinstaller"
+}
+
+# The windowed launcher under its current and its earlier name, then the CLI
+# under both of its names (kylo.spec).
+foreach ($required in @("KyloApp.exe", "PersonalJarvis.exe", "kylo.exe", "jarvis.exe")) {
+    $candidate = Join-Path $BundleDir $required
+    if (-not (Test-Path $candidate)) {
+        Stop-WithError "the frozen bundle is missing $required (expected at $candidate)"
+    }
+}
+
+# Running the app straight out of dist/Jarvis (the obvious way to smoke-test a
+# build) leaves runtime state behind in _internal: a jarvis.db, flight-recorder
+# JSONL, logs. Shipping that would put the builder's own data inside every
+# downloaded installer. The build output is defined by kylo.spec, so anything
+# below is not part of it and goes before the payload is compressed.
+$strayState = @("_internal\data", "_internal\data-dev", "_internal\logs")
+foreach ($stray in $strayState) {
+    $path = Join-Path $BundleDir $stray
+    if (Test-Path $path) {
+        Write-Step "removing runtime state left in the bundle: $stray"
+        Remove-Item -Recurse -Force $path
+    }
+}
+
+# --- 3. Inno Setup ---------------------------------------------------------
+function Find-Iscc {
+    $command = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+    if ($null -ne $command) { return $command.Source }
+    # ${env:ProgramFiles(x86)} needs the braces: without them PowerShell reads
+    # $env:ProgramFiles and leaves a literal "(x86)" behind.
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    return $null
+}
+
+$Iscc = Find-Iscc
+if ($null -eq $Iscc) {
+    Stop-WithError ("Inno Setup 6 is not installed. Install it with " +
+        "'winget install --id JRSoftware.InnoSetup -e' and run this script again.")
+}
+Write-Step "3/3 packaging with $Iscc"
+
+New-Item -ItemType Directory -Force -Path $InstallerDir | Out-Null
+
+$IsccArgs = @(
+    "/DAppVersion=$AppVersion",
+    "/DSourceDir=$BundleDir",
+    "/DOutputDir=$InstallerDir",
+    "/DIconFile=$IconFile",
+    $IssFile
+)
+Invoke-Checked -Executable $Iscc -Arguments $IsccArgs -WorkingDirectory $RepoRoot -What "ISCC"
+
+# The signed name (OutputBaseFilename = SignedSetupBaseName in the .iss).
+$Artifact = Join-Path $InstallerDir "Kylo-Setup-x64.exe"
+if (-not (Test-Path $Artifact)) {
+    Stop-WithError "ISCC reported success but $Artifact does not exist"
+}
+
+$SizeMb = [math]::Round((Get-Item $Artifact).Length / 1MB, 1)
+Write-Step "done - $Artifact ($SizeMb MB)"
+Write-Output $Artifact
+exit 0

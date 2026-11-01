@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "ui_bundle_dir": "kylo/ui/web/dist",
+  "launcher_module": "kylo.ui.web.launcher",
+  "version_file": "kylo/__init__.py",
+  "config_file": "jarvis.toml",
+  "config_files": ["jarvis.toml", "kylo.toml"],
+  "macos_app_dir_name": "Kylo.app",
+  "macos_bundle_id": "com.personal-jarvis.desktop",
+  "rollback_hook": "kylo/setup/update_rollback.py"
+}

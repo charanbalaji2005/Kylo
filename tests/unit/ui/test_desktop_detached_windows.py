@@ -1,0 +1,646 @@
+"""Detached solo windows: lifecycle, quit semantics, and the /api/window routes.
+
+The desktop shell can split a view into its own pywebview window
+(``DesktopApp.open_detached_window``). These tests pin the contracts that keep
+two windows from corrupting each other and the process from lingering:
+
+- distinct title per detached view (the title IS the Win32 window handle),
+- idempotent detach (second call focuses, never duplicates),
+- reasoned ``ok: false`` answers instead of exceptions,
+- the injection matrix (embedded flag always; broker token ONLY for the voice
+  window; the single-use ``__JARVIS_TOKEN`` never re-offered),
+- last-window-quit semantics (X on main with detached windows open must NOT
+  quit; the final window sets the flag; teardown sweeps the registry),
+- the routes' honest no-desktop-shell degradation and off-loop dispatch.
+
+House patterns: ``DesktopApp.__new__`` + attribute setup (no real GUI), fake
+``webview`` module via ``sys.modules`` (test_native_drag.py), recording
+windows (test_desktop_show_window.py).
+"""
+from __future__ import annotations
+
+import asyncio
+import threading
+from types import ModuleType, SimpleNamespace
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from kylo.ui.desktop_app import DETACHABLE_VIEWS, WINDOW_TITLE, DesktopApp
+from kylo.ui.section_windows import section_window
+from kylo.ui.web.desktop_routes import router as desktop_router
+
+
+class _FakeWindow:
+    def __init__(self, title: str = "", url: str = "") -> None:
+        self.title = title
+        self.url = url
+        self.destroyed = False
+        self.shown = 0
+        self.restored = False
+        self.evaluated: list[str] = []
+        self.events = SimpleNamespace(
+            loaded=_List(), closed=_List(), closing=_List(), shown=_List(),
+        )
+
+    def show(self) -> None:
+        self.shown += 1
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+    def restore(self) -> None:
+        self.restored = True
+
+    def evaluate_js(self, js: str) -> None:
+        self.evaluated.append(js)
+
+
+class _List(list):
+    """Supports the ``events.closed += handler`` subscription idiom."""
+
+    def __iadd__(self, handler: Any) -> _List:
+        self.append(handler)
+        return self
+
+
+def _fake_webview(created: list[_FakeWindow], *, fail: bool = False) -> ModuleType:
+    mod = ModuleType("webview")
+
+    class WebViewException(Exception):
+        pass
+
+    def create_window(title: str, url: str, **kwargs: Any) -> _FakeWindow:
+        if fail:
+            raise WebViewException("runtime window creation unsupported")
+        window = _FakeWindow(title, url)
+        window.frameless = kwargs.get("frameless", False)
+        window.resizable = kwargs.get("resizable", True)
+        created.append(window)
+        return window
+
+    mod.WebViewException = WebViewException  # type: ignore[attr-defined]
+    mod.create_window = create_window  # type: ignore[attr-defined]
+    return mod
+
+
+def _app(monkeypatch: pytest.MonkeyPatch | None = None) -> DesktopApp:
+    app = DesktopApp.__new__(DesktopApp)
+    app.cfg = SimpleNamespace(
+        ui=SimpleNamespace(dev_mode=False, admin_api_port=8781)
+    )
+    app._window = _FakeWindow(WINDOW_TITLE)
+    app._window_visible = True
+    app._detached_windows = {}
+    app._user_requested_quit = False
+    app._backend_loop = None
+    app._server = None
+    app.realtime_transport_broker_token = "broker-secret"  # noqa: S105
+    app._window_background = lambda: "#101010"  # type: ignore[method-assign]
+    app.published: list[tuple[str, bool]] = []
+    app._publish_detached_event_threadsafe = (  # type: ignore[method-assign]
+        lambda view, *, opened: app.published.append((view, opened))
+    )
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            "kylo.ui.desktop_app._bring_window_to_front_by_title",
+            lambda _title: True,
+        )
+        monkeypatch.setattr(
+            "kylo.ui.icon_utils.set_window_icon_by_title",
+            lambda _title, _icon: True,
+        )
+        monkeypatch.setattr(
+            "kylo.ui.icon_utils.project_icon_path", lambda: "icon.ico"
+        )
+    return app
+
+
+# --- open_detached_window ----------------------------------------------------
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+@pytest.mark.parametrize("view", sorted(DETACHABLE_VIEWS))
+def test_open_detached_creates_titled_solo_window(monkeypatch, platform, view) -> None:
+    import sys
+
+    app = _app(monkeypatch)
+    monkeypatch.setattr(sys, "platform", platform)
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+
+    result = app.open_detached_window(view)
+
+    # A tab of a section family opens its owner's shared window.
+    owner = section_window(view)
+    assert result == {"ok": True, "already_open": False, "view": owner}
+    assert len(created) == 1
+    window = created[0]
+    assert window.frameless is (platform != "darwin")
+    assert window.resizable is True
+    # Distinct title: FindWindowW-exact focus and the icon setter key on it.
+    assert window.title == app._detached_title(owner)
+    assert window.title != WINDOW_TITLE
+    assert f"?view={view}&solo=1" in window.url
+    assert app._detached_windows == {owner: window}
+    assert len(window.events.loaded) == 1  # injection hook
+    assert len(window.events.closed) == 1  # deregistration hook
+    assert app.published == [(owner, True)]
+
+
+def test_open_detached_is_idempotent_and_focuses(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    app = _app(monkeypatch)
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+    focused: list[str] = []
+    monkeypatch.setattr(
+        "kylo.ui.desktop_app._bring_window_to_front_by_title",
+        lambda title: focused.append(title) or True,
+    )
+
+    app.open_detached_window("jarvisx-editor")
+    result = app.open_detached_window("jarvisx-editor")
+
+    assert result == {"ok": True, "already_open": True, "view": "jarvisx-editor"}
+    assert len(created) == 1  # never a duplicate window
+    assert focused == [f"{WINDOW_TITLE} — Kylo X Editor"]
+
+
+@pytest.mark.parametrize("section", ["agentic-ide", "chats", "agents", "settings", "visualization"])
+def test_sections_never_open_their_own_window(monkeypatch, section) -> None:
+    """Sections are tiled inside the main window; only tool windows detach."""
+    app = _app(monkeypatch)
+    assert app.open_detached_window(section) == {"ok": False, "reason": "unknown_view"}
+
+
+def test_open_detached_rejects_unknown_view(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    assert app.open_detached_window("nonexistent") == {
+        "ok": False,
+        "reason": "unknown_view",
+    }
+
+
+def test_reopening_a_macos_detached_window_restores_and_shows_it(monkeypatch) -> None:
+    monkeypatch.setattr("kylo.ui.desktop_app.sys.platform", "darwin")
+    app = _app(monkeypatch)
+    window = _FakeWindow()
+    app._detached_windows["jarvisx-editor"] = window
+
+    result = app.open_detached_window("jarvisx-editor")
+
+    assert result == {"ok": True, "already_open": True, "view": "jarvisx-editor"}
+    assert window.shown and window.restored
+    assert app._detached_windows == {"jarvisx-editor": window}
+
+
+def test_macos_detached_restore_failure_is_reported(monkeypatch) -> None:
+    monkeypatch.setattr("kylo.ui.desktop_app.sys.platform", "darwin")
+    app = _app(monkeypatch)
+    window = _FakeWindow()
+
+    def failed_restore() -> None:
+        raise RuntimeError("window unavailable")
+
+    window.restore = failed_restore
+    app._detached_windows["jarvisx-editor"] = window
+
+    result = app.open_detached_window("jarvisx-editor")
+
+    assert result["ok"] is False
+    assert result["fallback_url"] == "/?view=jarvisx-editor&solo=1"
+    assert app._detached_windows == {"jarvisx-editor": window}
+
+
+def test_native_close_of_warm_macos_editor_allows_a_fresh_open(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    app = _app(monkeypatch)
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+
+    assert app.prewarm_appshot_editor()["ok"] is True
+    closed = created[0]
+    for handler in closed.events.closed:
+        handler()
+
+    assert app.detached_views_snapshot() == []
+    assert app.published == [("appshot-editor", False)]
+    assert app._user_requested_quit is False
+    assert app.prewarm_appshot_editor()["already_open"] is False
+    assert app._detached_windows["appshot-editor"] is created[1]
+    assert created[1].frameless is False
+
+
+def test_missing_detached_window_never_closes_main(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    result = app.window_command("close", "settings")
+    assert result["ok"] is False
+    assert app._window.destroyed is False
+
+
+def test_open_detached_reports_backend_failure_with_fallback(monkeypatch) -> None:
+    import sys
+
+    app = _app(monkeypatch)
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview([], fail=True))
+
+    result = app.open_detached_window("jarvisx-editor")
+
+    assert result["ok"] is False
+    assert "WebViewException" in result["reason"]
+    assert result["fallback_url"] == "/?view=jarvisx-editor&solo=1"
+    assert app._detached_windows == {}
+
+
+def test_open_detached_without_any_live_window(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    app._window = None
+
+    result = app.open_detached_window("jarvisx-editor")
+
+    assert result["ok"] is False
+    assert result["reason"] == "no_live_window"
+    assert result["fallback_url"] == "/?view=jarvisx-editor&solo=1"
+
+
+# --- injection matrix --------------------------------------------------------
+
+
+def test_tool_window_gets_no_broker_token(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    window = _FakeWindow()
+
+    app._inject_into_secondary(window, "jarvisx-editor")
+
+    js = "".join(window.evaluated)
+    assert "__JARVIS_EMBEDDED_DESKTOP = true" in js
+    assert "__JARVIS_REALTIME_BROKER_TOKEN" not in js
+    assert "jarvis-token-ready" in js
+
+
+# --- quit semantics ----------------------------------------------------------
+
+
+def test_main_close_with_detached_window_does_not_quit(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    app._detached_windows["jarvisx-editor"] = _FakeWindow()
+
+    assert app._on_window_closing() is True  # destroy proceeds either way
+    assert app._user_requested_quit is False  # ...but the process lives on
+
+
+def test_main_close_without_detached_windows_quits(monkeypatch) -> None:
+    app = _app(monkeypatch)
+
+    assert app._on_window_closing() is True
+    assert app._user_requested_quit is True  # 2026-07-01 mandate unchanged
+
+
+def test_main_closed_hook_nulls_the_handle(monkeypatch) -> None:
+    app = _app(monkeypatch)
+
+    app._on_main_window_closed()
+
+    assert app._window is None
+    assert app._window_visible is False
+
+
+def test_detached_close_with_main_alive_keeps_running(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    app._detached_windows["jarvisx-editor"] = _FakeWindow()
+
+    app._on_detached_closed("jarvisx-editor")
+
+    assert app._detached_windows == {}
+    assert app.published == [("jarvisx-editor", False)]
+    assert app._user_requested_quit is False
+
+
+def test_last_window_close_sets_the_quit_flag(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    app._window = None  # main already closed earlier
+    app._detached_windows["jarvisx-editor"] = _FakeWindow()
+
+    app._on_detached_closed("jarvisx-editor")
+
+    assert app._user_requested_quit is True  # webview.start() returns → quit
+
+
+def test_destroy_all_windows_sweeps_detached_then_main(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    main = app._window
+    detached = _FakeWindow()
+    app._detached_windows["jarvisx-editor"] = detached
+
+    app._destroy_all_windows()
+
+    assert detached.destroyed is True
+    assert main.destroyed is True
+    assert app._detached_windows == {}
+
+
+# --- close_detached_window / snapshot ---------------------------------------
+
+
+def test_close_detached_window_destroys_only_that_window(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    window = _FakeWindow()
+    app._detached_windows["jarvisx-editor"] = window
+
+    result = app.close_detached_window("jarvisx-editor")
+
+    assert result == {"ok": True, "view": "jarvisx-editor"}
+    assert window.destroyed is True
+    # Deregistration happens in the closed hook (same path as the window's X),
+    # which the fake does not fire — the registry entry is still present here.
+    assert "jarvisx-editor" in app._detached_windows
+
+
+def test_close_detached_window_when_not_detached(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    assert app.close_detached_window("jarvisx-editor") == {
+        "ok": False,
+        "reason": "not_detached",
+    }
+
+
+def test_snapshot_lists_detached_views(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    app._detached_windows["jarvisx-editor"] = _FakeWindow()
+    app._detached_windows["appshot-editor"] = _FakeWindow()
+
+    assert app.detached_views_snapshot() == ["jarvisx-editor", "appshot-editor"]
+
+
+# --- _ensure_main_window -----------------------------------------------------
+
+
+@pytest.mark.parametrize("view", ["jarvisx-editor", "appshot-editor"])
+def test_second_launch_reopens_main_while_a_detached_window_keeps_running(
+    monkeypatch, view,
+) -> None:
+    """The real focus route must recover a closed main without replacing its process."""
+    import sys
+
+    from kylo.ui import desktop_app
+    from kylo.ui.web import launcher
+
+    app = _app(monkeypatch)
+    secondary = _FakeWindow(app._detached_title(view))
+    app._detached_windows[view] = secondary
+    assert app._on_window_closing() is True
+    app._on_main_window_closed()
+    assert not app._user_requested_quit
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+    monkeypatch.setattr(desktop_app, "window_needs_restore", lambda _title: False)
+    monkeypatch.setattr(desktop_app, "window_restores_maximized", lambda _title: False)
+    app._restore_overlay_for_visible_window = lambda: None
+    api = FastAPI()
+    api.state.desktop_app = app
+    app._install_focus_route(SimpleNamespace(app=api))
+
+    def unexpected_recovery(*_args, **_kwargs):
+        pytest.fail("A live detached window must not trigger stuck-process recovery")
+
+    with TestClient(api) as client:
+        def focus():
+            response = client.post("/api/window/focus")
+            assert response.json() == {"ok": True, "focused": True}
+            return desktop_app._focus_response_means_window_raised(response)
+
+        for _ in range(2):
+            assert launcher._recover_from_already_running(
+                desktop_app.SingleInstanceError("already running (pid=4242)"),
+                focus=focus,
+                read_meta=lambda: {"pid": 4242, "port": 47821},
+                health=lambda _port: True,
+                ask=unexpected_recovery,
+                terminate=unexpected_recovery,
+                acquire=unexpected_recovery,
+            ) is None
+
+    assert len(created) == 1
+    assert app._window is created[0]
+    assert created[0].shown == 2
+    assert app._detached_windows == {view: secondary}
+    assert not secondary.destroyed
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+def test_ensure_main_window_recreates_and_rehooks(monkeypatch, platform) -> None:
+    import sys
+
+    app = _app(monkeypatch)
+    monkeypatch.setattr(sys, "platform", platform)
+    app._window = None
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+
+    app._ensure_main_window()
+
+    assert len(created) == 1
+    assert created[0].title == WINDOW_TITLE
+    assert app._window is created[0]
+    assert created[0].frameless is (platform != "darwin")
+    assert created[0].resizable is True
+    assert app._window_visible is True
+    assert len(created[0].events.closing) == 1  # quit contract re-attached
+    assert len(created[0].events.closed) == 1  # null-out re-attached
+    assert len(created[0].events.loaded) == 2  # drop bridge and authenticated shell restore
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+def test_main_window_chrome_matches_native_frame(monkeypatch, platform) -> None:
+    import sys
+
+    app = _app(monkeypatch)
+    monkeypatch.setattr(sys, "platform", platform)
+    options = app._main_window_kwargs()
+    assert options["frameless"] is (platform != "darwin")
+    assert options["resizable"] is True
+    app._window.frameless = options["frameless"]
+    snapshot = app.window_chrome_snapshot()
+    assert snapshot["frameless"] is options["frameless"]
+    assert snapshot["controls"] == ("none" if platform == "darwin" else "trailing")
+
+    app._window = None
+    assert app.window_chrome_snapshot()["controls"] == "none"
+
+
+# --- native drop bridge --------------------------------------------------------
+
+
+def test_every_window_load_rewires_the_drop_path_bridge(monkeypatch) -> None:
+    """pywebview forgets DOM handlers on each page load, and the UI reloads
+    itself after a frontend build — so the bridge is (re)registered from the
+    ``loaded`` hook of the main window and of every detached window."""
+    import sys
+
+    registered: list[Any] = []
+    monkeypatch.setattr(
+        "kylo.ui.native_drop.register_native_drop",
+        lambda window: registered.append(window) or True,
+    )
+    app = _app(monkeypatch)
+    app._hook_main_window_lifecycle()
+    for hook in app._window.events.loaded:
+        hook()
+    assert registered == [app._window]
+
+    created: list[_FakeWindow] = []
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview(created))
+    app.open_detached_window("jarvisx-editor")
+    for hook in created[0].events.loaded:
+        hook()
+    assert registered == [app._window, created[0]]
+
+
+def test_ensure_main_window_shows_existing_window(monkeypatch) -> None:
+    app = _app(monkeypatch)
+    shown: list[bool] = []
+    app._safe_window_show = lambda: shown.append(True)  # type: ignore[method-assign]
+
+    app._ensure_main_window()
+
+    assert shown == [True]
+
+
+def test_ensure_main_window_survives_create_failure(monkeypatch) -> None:
+    import sys
+
+    app = _app(monkeypatch)
+    app._window = None
+    monkeypatch.setitem(sys.modules, "webview", _fake_webview([], fail=True))
+
+    app._ensure_main_window()  # must not raise — honest logged no-op
+
+    assert app._window is None
+
+
+# --- event publish (bus down) ------------------------------------------------
+
+
+def test_publish_without_backend_loop_is_honest_noop() -> None:
+    app = DesktopApp.__new__(DesktopApp)
+    app._backend_loop = None
+    app._server = None
+
+    # Must not raise: during early boot/teardown there is no bus — and no
+    # frontend listening either.
+    app._publish_detached_event_threadsafe("jarvisx-editor", opened=True)
+
+
+# --- registry constant -------------------------------------------------------
+
+
+def test_detachable_views_have_distinct_titles_per_label() -> None:
+    # Every view must produce a title distinct from the main window's, and no
+    # two views that can be detached AT THE SAME TIME may share a title —
+    # FindWindowW-by-title would focus/icon the wrong window. The coding family
+    # shares one label deliberately: only one coding view can be live at once
+    # (single-IDE rule), so their titles can never coexist.
+    app = DesktopApp.__new__(DesktopApp)
+    seen: dict[str, str] = {}
+    for view in DETACHABLE_VIEWS:
+        title = app._detached_title(view)
+        assert title != WINDOW_TITLE
+        assert title.startswith(WINDOW_TITLE)
+        clash = seen.get(title)
+        if clash is not None:
+            assert section_window(view) == section_window(clash), (
+                f"'{view}' and '{clash}' share the title '{title}' but can be "
+                "detached simultaneously"
+            )
+        seen[title] = view
+
+
+# --- routes ------------------------------------------------------------------
+
+
+def _client(desktop: Any | None) -> TestClient:
+    api = FastAPI()
+    api.include_router(desktop_router)
+    if desktop is not None:
+        api.state.desktop_app = desktop
+    return TestClient(api)
+
+
+def test_detach_route_without_desktop_shell_degrades_honestly() -> None:
+    response = _client(None).post("/api/window/detach", json={"view": "jarvisx-editor"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "no_desktop_shell"
+    assert body["fallback_url"] == "/?view=jarvisx-editor&solo=1"
+
+
+def test_detach_route_dispatches_off_the_event_loop() -> None:
+    seen: dict[str, Any] = {}
+
+    def open_detached_window(view: str) -> dict[str, Any]:
+        seen["view"] = view
+        try:
+            asyncio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False  # correct: a plain worker thread
+        seen["thread"] = threading.current_thread().name
+        return {"ok": True, "already_open": False, "view": view}
+
+    desktop = SimpleNamespace(open_detached_window=open_detached_window)
+    response = _client(desktop).post(
+        "/api/window/detach", json={"view": "jarvisx-editor"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert seen["view"] == "jarvisx-editor"
+    assert seen["on_loop"] is False
+
+
+def test_detach_route_surfaces_handler_failure_with_fallback() -> None:
+    def open_detached_window(_view: str) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    desktop = SimpleNamespace(open_detached_window=open_detached_window)
+    response = _client(desktop).post("/api/window/detach", json={"view": "jarvisx-editor"})
+
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "detach_failed"
+    assert "boom" not in str(body)
+    assert body["fallback_url"] == "/?view=jarvisx-editor&solo=1"
+
+
+def test_detached_route_snapshot_and_headless_empty() -> None:
+    assert _client(None).get("/api/window/detached").json() == {
+        "ok": True,
+        "views": [],
+    }
+    desktop = SimpleNamespace(detached_views_snapshot=lambda: ["jarvisx-editor"])
+    assert _client(desktop).get("/api/window/detached").json() == {
+        "ok": True,
+        "views": ["jarvisx-editor"],
+    }
+
+
+def test_reattach_route_shapes() -> None:
+    assert _client(None).post(
+        "/api/window/reattach", json={"view": "jarvisx-editor"}
+    ).json() == {"ok": False, "reason": "no_desktop_shell"}
+
+    desktop = SimpleNamespace(
+        close_detached_window=lambda view: {"ok": True, "view": view}
+    )
+    assert _client(desktop).post(
+        "/api/window/reattach", json={"view": "jarvisx-editor"}
+    ).json() == {"ok": True, "view": "jarvisx-editor"}

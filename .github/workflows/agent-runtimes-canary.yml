@@ -1,0 +1,137 @@
+name: Agent runtimes canary
+# Installs the LATEST Hermes and OpenClaw through the app's own setup job (the
+# pin is pointed at upstream latest in the canary's checkout only) and runs
+# scripts/ci/agent_runtime_e2e.py: two turns per model-gateway protocol against
+# scripted providers, the fake-model driver check, the runtime unit tests and
+# the PATH / shell-profile checks. No key, no network to a model. Every pull
+# request already proves the PINNED versions (ci.yml, agent-runtimes-e2e); this
+# checks what upstream ships next:
+#   * green on every OS -> a pull request raises the pin in
+#     kylo/agent_runtimes/runtime-versions.json (scripts/ci/agent_runtime_suite.py);
+#   * red on a schedule -> an issue, and the pin stays where it is.
+# See docs/agent-runtimes.md ("CI and release gates").
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        runtime: [hermes, openclaw]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      # agent_runtime_e2e.py ends with `pytest tests/unit/agent_runtimes` on the
+      # same machine, so the test runner must be there like in ci.yml's legs.
+      - name: Install the base app
+        run: |
+          python scripts/pip_install.py -e "."
+          python -m pip install pytest pytest-asyncio
+      # The app's own setup installs whatever the pin names; in this checkout
+      # only, the pin points at upstream latest (newest OpenClaw on npm, the
+      # head of Hermes' default branch).
+      - name: Aim the app's setup at upstream latest
+        run: python scripts/ci/agent_runtime_suite.py --point-at-latest ${{ matrix.runtime }}
+      - name: Set up through the app, drive it, prove nothing else changed
+        run: python scripts/ci/agent_runtime_e2e.py ${{ matrix.runtime }} --allow-untested
+      - name: Record the version that passed
+        run: python scripts/ci/agent_runtime_suite.py --report ${{ matrix.runtime }} --out canary-report.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: canary-report-${{ matrix.runtime }}-${{ matrix.os }}
+          path: canary-report.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Keep the runtime log of a failed run
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: canary-log-${{ matrix.runtime }}-${{ matrix.os }}
+          path: eval-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Only what passed on all three OSes is recorded; a runtime with a red or
+  # missing OS keeps its pin (bump_from). The repository does not let the
+  # workflow token open pull requests ("GitHub Actions is not permitted to
+  # create or approve pull requests", run 40503244162), so the merge bot app
+  # pushes the branch and opens it, like contributors.yml and
+  # frontend-bundle.yml; its token also starts the pull request's CI, which
+  # is the pin's admission. A maintainer merges it.
+  raise-pin:
+    needs: canary
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: canary-report-*
+          path: reports
+      - name: Raise the pins every OS agreed on
+        id: bump
+        run: python3 scripts/ci/agent_runtime_suite.py --bump-from reports
+      - name: Mint a merge bot token
+        id: bot
+        if: steps.bump.outputs.changed == 'true' && vars.MERGE_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open a pull request with the new pins
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::MERGE_APP_ID is not set, so no pull request can raise the pins (see merge-train.yml)."
+            exit 1
+          fi
+          branch="ci/agent-runtime-pins-${GITHUB_RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add kylo/agent_runtimes/runtime-versions.json
+          git commit -m "chore(agent-runtimes): raise the tested runtime versions" \
+            -m "The weekly canary passed both model-gateway protocols on Linux, Windows and macOS: $RUN_URL"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --head "$branch" --base "$DEFAULT_BRANCH" \
+            --title "chore(agent-runtimes): raise the tested runtime versions" \
+            --body "The weekly canary drove the latest Hermes / OpenClaw through Kylo' model gateway on every OS: $RUN_URL. Merging raises the version the app installs (see docs/agent-runtimes.md)."
+
+  report:
+    needs: canary
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue for the broken runtime integration
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Agent runtimes canary failed" \
+            --body "The weekly canary could not drive the latest Hermes or OpenClaw release through Kylo' model gateway. The pinned versions stay in place. Run: $RUN_URL (see docs/agent-runtimes.md)."

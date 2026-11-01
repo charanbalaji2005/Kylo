@@ -1,0 +1,1077 @@
+version: 1
+language: en
+content_root: docs/product
+page_count: 49
+navigation_principle: reader-journey
+authoring_contract:
+  audience: People using Kylo, including readers with no software background.
+  style: Lead with the outcome, explain one idea at a time, and prefer short examples and diagrams over large code blocks.
+  safety: Use placeholders for credentials, account identifiers, paths, phone numbers, and personal data. Never copy local secrets or PII into documentation.
+  connections: Every page must explain how its feature connects to the related features named in this manifest.
+generated_reference_policy:
+  policy: link-only
+  description: Generated references remain generated. Reader pages may introduce and link to them, but must not copy or hand-maintain their contents.
+  paths:
+    - docs/commands-reference.md
+    - docs/kylo-cli-reference.md
+
+pages:
+  - section: Start here
+    section_order: 1
+    order: 1
+    slug: welcome-to-kylo
+    file: docs/product/start-here/welcome-to-kylo.md
+    title: Welcome to Kylo
+    diataxis: explanation
+    summary: See how Kylo turns your computer into an AI agent, what stays under your control, and where to begin.
+    authoritative_sources:
+      - README.md
+      - AGENTS.md
+      - kylo/ui/web/frontend/src/components/layout/Sidebar.tsx
+      - kylo/ui/web/frontend/src/components/layout/MainView.tsx
+    related:
+      - install-kylo
+      - desktop-app-tour
+      - start-your-first-chat
+    reader_level: beginner
+    maturity: stable
+
+  - section: Start here
+    section_order: 1
+    order: 2
+    slug: install-kylo
+    file: docs/product/start-here/install-kylo.md
+    title: Install Kylo
+    diataxis: howto
+    summary: Install Kylo on a desktop or headless Linux host, choose an update path, and protect your data during repair.
+    authoritative_sources:
+      - install/README.md
+      - install/install.ps1
+      - install/install.sh
+      - install/installer.py
+      - pyproject.toml
+    related:
+      - first-run-setup
+      - local-ai-providers
+      - platform-support
+      - troubleshooting
+    reader_level: beginner
+    maturity: stable
+
+  - section: Start here
+    section_order: 1
+    order: 3
+    slug: first-run-setup
+    file: docs/product/start-here/first-run-setup.md
+    title: Complete First-Run Setup
+    diataxis: tutorial
+    summary: Your pet explains the app, then you add one key, connect a subscription, pick a wake word and try ten first steps.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/components/onboarding/setup/SetupTour.tsx
+      - kylo/ui/web/frontend/src/components/onboarding/setup/setupSteps.ts
+      - kylo/ui/web/frontend/src/components/onboarding/tour/tourSteps.ts
+      - kylo/ui/web/onboarding_routes.py
+    related:
+      - providers-and-api-keys
+      - audio-and-wake-word
+      - permissions
+      - start-your-first-chat
+    reader_level: beginner
+    maturity: stable
+
+  - section: Start here
+    section_order: 1
+    order: 4
+    slug: desktop-app-tour
+    file: docs/product/start-here/desktop-app-tour.md
+    title: Tour the Desktop App
+    diataxis: explanation
+    summary: Learn where conversations, agents, tools, history, settings, and help live in the desktop app.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/App.tsx
+      - kylo/ui/web/frontend/src/components/layout/Sidebar.tsx
+      - kylo/ui/web/frontend/src/components/layout/MainView.tsx
+      - kylo/ui/web/frontend/src/i18n/locales/en.json
+    related:
+      - start-your-first-chat
+      - chats
+      - find-help-in-the-app
+    reader_level: beginner
+    maturity: stable
+
+  - section: Start here
+    section_order: 1
+    order: 5
+    slug: start-your-first-chat
+    file: docs/product/start-here/start-your-first-chat.md
+    title: Start Your First Chat
+    diataxis: tutorial
+    summary: Send a first message, dictate a draft, add bounded context, and reopen what the app saved.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/ChatsView.tsx
+      - kylo/ui/web/chats_routes.py
+      - kylo/state/chat_store.py
+      - kylo/ui/web/frontend/src/lib/chatsApi.ts
+    related:
+      - chats
+      - dictation
+      - outputs-and-files
+      - sessions-and-run-inspector
+    reader_level: beginner
+    maturity: stable
+
+  - section: Start here
+    section_order: 1
+    order: 6
+    slug: start-your-first-voice-conversation
+    file: docs/product/start-here/start-your-first-voice-conversation.md
+    title: Start Your First Voice Conversation
+    diataxis: tutorial
+    summary: Start a voice conversation, follow each listening and reply state, and end the call safely on desktop or in the browser.
+    authoritative_sources:
+      - kylo/speech/pipeline.py
+      - kylo/realtime/session.py
+      - kylo/ui/web/voice_runtime.py
+      - kylo/ui/web/frontend/src/components/VoiceIndicator.tsx
+    related:
+      - voice-conversations
+      - audio-and-wake-word
+      - dictation
+      - languages-and-voices
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 1
+    slug: chats
+    file: docs/product/everyday-use/chats.md
+    title: Chats
+    diataxis: howto
+    summary: Organize conversations, continue earlier work, add files, and understand how chats relate to sessions and outputs.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/ChatsView.tsx
+      - kylo/ui/web/chats_routes.py
+      - kylo/channels/chat_bridge.py
+      - kylo/state/chat_store.py
+    related:
+      - sessions-and-run-inspector
+      - outputs-and-files
+      - instructions-and-persona
+      - dictation
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 2
+    slug: voice-conversations
+    file: docs/product/everyday-use/voice-conversations.md
+    title: Voice Conversations
+    diataxis: explanation
+    summary: Understand how Pipeline and Realtime handle spoken questions, actions, privacy, interruptions, and fallback.
+    authoritative_sources:
+      - kylo/speech/pipeline.py
+      - kylo/realtime/session.py
+      - kylo/browser_voice/session.py
+      - kylo/core/turn_language.py
+    related:
+      - audio-and-wake-word
+      - dictation
+      - local-ai-providers
+      - sessions-and-run-inspector
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 3
+    slug: tasks-and-reminders
+    file: docs/product/everyday-use/tasks-and-reminders.md
+    title: Tasks and Reminders
+    diataxis: howto
+    summary: Schedule recurring and one-off work as routines on your agents, then review, pause or stop each run.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/components/society/card/AgentRoutinesList.tsx
+      - kylo/society/routines.py
+      - kylo/ui/web/tasks_routes.py
+      - kylo/tasks/store.py
+      - kylo/tasks/scheduler.py
+      - kylo/tasks/approval_bridge.py
+    related:
+      - jarvis-agents
+      - workflows-and-commands
+      - safety-and-approvals
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 4
+    slug: sessions-and-run-inspector
+    file: docs/product/everyday-use/sessions-and-run-inspector.md
+    title: Sessions and Run Inspector
+    diataxis: explanation
+    summary: See the difference between conversation history and a detailed run trace, then use both to understand an answer.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/SessionsView.tsx
+      - kylo/ui/web/frontend/src/components/agentchat/WorkTrace.tsx
+      - kylo/ui/web/sessions_routes.py
+      - kylo/ui/web/diagnostics_routes.py
+      - kylo/sessions/recorder.py
+    related:
+      - chats
+      - voice-conversations
+      - troubleshooting
+      - privacy-and-local-data
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 5
+    slug: outputs-and-files
+    file: docs/product/everyday-use/outputs-and-files.md
+    title: Outputs and Files
+    diataxis: howto
+    summary: Find generated files, preview them safely, open them in another app, and recover unfinished work when available.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/VisualizationView.tsx
+      - kylo/ui/web/outputs_routes.py
+      - kylo/ui/web/downloads_routes.py
+      - kylo/ui/web/frontend/src/lib/fileActions.ts
+    related:
+      - chats
+      - jarvis-agents
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 6
+    slug: speech-dictionary
+    file: docs/product/everyday-use/speech-dictionary.md
+    title: Speech Dictionary
+    diataxis: howto
+    summary: Teach speech recognition names and specialist words it often mishears, then test the improvement.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/DictionaryView.tsx
+      - kylo/ui/web/dictionary_routes.py
+      - kylo/speech/stt_dictionary.py
+    related:
+      - voice-conversations
+      - audio-and-wake-word
+      - languages-and-voices
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 7
+    slug: profile-and-contacts
+    file: docs/product/everyday-use/profile-and-contacts.md
+    title: Profile and Contacts
+    diataxis: howto
+    summary: Keep your own preferences and the people you mention organized, and understand how both support more relevant conversations.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/ProfileView.tsx
+      - kylo/ui/web/frontend/src/views/contacts/ContactsView.tsx
+      - kylo/ui/web/profile_routes.py
+      - kylo/ui/web/contacts_routes.py
+      - kylo/contacts/store.py
+    related:
+      - instructions-and-persona
+      - wiki-and-memory
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 8
+    slug: dictation
+    file: docs/product/everyday-use/dictation.md
+    title: Dictate Into Any App
+    diataxis: howto
+    summary: Turn speech into text in the focused field, recover missed words, and choose what stays local or uses a provider.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/DictationView.tsx
+      - kylo/ui/web/frontend/src/views/voice/ShortcutsTab.tsx
+      - kylo/ui/web/frontend/src/views/voice/LanguageTab.tsx
+      - kylo/ui/web/dictation_routes.py
+      - kylo/dictation/history.py
+      - kylo/speech/pipeline.py
+    related:
+      - voice-conversations
+      - speech-dictionary
+      - providers-and-api-keys
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 1
+    slug: providers-and-api-keys
+    file: docs/product/personalize-and-connect/providers-and-api-keys.md
+    title: Providers and API Keys
+    diataxis: howto
+    summary: Connect cloud services or local models to each assistant capability, then verify what is actually ready.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/ApiKeysView.tsx
+      - kylo/ui/web/provider_routes.py
+      - kylo/brain/provider_registry.py
+      - kylo/brain/resolver.py
+      - kylo/core/config.py
+    related:
+      - local-ai-providers
+      - dictation
+      - credentials-and-secrets
+      - jarvis-agents
+    reader_level: beginner
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 2
+    slug: audio-and-wake-word
+    file: docs/product/personalize-and-connect/audio-and-wake-word.md
+    title: Audio Devices and Wake Word
+    diataxis: howto
+    summary: Choose a microphone and speaker, set a wake phrase, and tune reliable hands-free listening.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/settings/AudioDevicesGroup.tsx
+      - kylo/ui/web/frontend/src/views/SettingsView.tsx
+      - kylo/speech/wake_phrase.py
+      - kylo/plugins/wake/openwakeword_provider.py
+      - docs/local-wakeword/USER-GUIDE-WAKE-WORD.md
+    related:
+      - voice-conversations
+      - speech-dictionary
+      - permissions
+      - troubleshooting
+    reader_level: beginner
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 3
+    slug: languages-and-voices
+    file: docs/product/personalize-and-connect/languages-and-voices.md
+    title: Languages and Voices
+    diataxis: howto
+    summary: Choose reply language, speech language, and speaking voice while keeping every layer of a conversation consistent.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/settings/LanguagesGroup.tsx
+      - kylo/ui/web/frontend/src/views/settings/RealtimeVoiceGroup.tsx
+      - kylo/core/turn_language.py
+      - kylo/plugins/tts/grok_voice_tts.py
+      - kylo/realtime/factory.py
+    related:
+      - voice-conversations
+      - providers-and-api-keys
+      - audio-and-wake-word
+    reader_level: beginner
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 4
+    slug: settings-and-appearance
+    file: docs/product/personalize-and-connect/settings-and-appearance.md
+    title: Settings and Appearance
+    diataxis: howto
+    summary: Adjust startup, sound, keyboard shortcuts, the Kylo Bar, overlays, and other everyday behavior.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/SettingsView.tsx
+      - kylo/ui/web/frontend/src/views/settings/AppSettingsGroup.tsx
+      - kylo/ui/web/frontend/src/views/settings/OverlayTaskbarGroup.tsx
+      - kylo/ui/web/frontend/src/views/settings/KeyboardMap.tsx
+      - kylo/ui/web/settings_routes.py
+    related:
+      - desktop-app-tour
+      - audio-and-wake-word
+      - permissions
+    reader_level: beginner
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 5
+    slug: instructions-and-persona
+    file: docs/product/personalize-and-connect/instructions-and-persona.md
+    title: Instructions and Persona
+    diataxis: howto
+    summary: Shape how your assistant responds without changing providers, memories, or safety rules.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/AssistantProfileView.tsx
+      - kylo/brain/agent_instructions.py
+      - kylo/brain/persona_loader.py
+      - kylo/brain/KYLO_PERSONA.md
+      - kylo/ui/web/frontend/src/views/settings/SystemPromptGroup.tsx
+    related:
+      - chats
+      - profile-and-contacts
+      - safety-and-approvals
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 6
+    slug: phone-calls
+    file: docs/product/personalize-and-connect/phone-calls.md
+    title: Phone Calls
+    diataxis: howto
+    summary: Connect the optional telephony feature, understand inbound and outbound calls, and keep call credentials private.
+    authoritative_sources:
+      - docs/telephony.md
+      - kylo/ui/web/frontend/src/views/TelephonyView.tsx
+      - kylo/ui/web/telephony_routes.py
+      - kylo/telephony/session.py
+      - kylo/telephony/security.py
+    related:
+      - providers-and-api-keys
+      - credentials-and-secrets
+      - safety-and-approvals
+    reader_level: advanced
+    maturity: stable
+
+  - section: Personalize and connect
+    section_order: 3
+    order: 7
+    slug: local-ai-providers
+    file: docs/product/personalize-and-connect/local-ai-providers.md
+    title: Use Local AI Providers
+    diataxis: howto
+    summary: Run chat and speech on your own machine, or connect a trusted self-hosted server, without making cloud access mandatory.
+    authoritative_sources:
+      - kylo/ui/web/provider_spec.py
+      - kylo/ui/web/provider_routes.py
+      - kylo/speech/local_models.py
+      - kylo/speech/local_install.py
+      - kylo/plugins/brain/ollama.py
+      - kylo/plugins/brain/local_openai.py
+      - kylo/plugins/stt/nemotron_local.py
+      - kylo/plugins/tts/piper_local.py
+    related:
+      - providers-and-api-keys
+      - dictation
+      - voice-conversations
+    reader_level: beginner
+    maturity: stable
+
+  - section: Knowledge and sharing
+    section_order: 4
+    order: 1
+    slug: wiki-and-memory
+    file: docs/product/knowledge-and-sharing/wiki-and-memory.md
+    title: Wiki and Memory
+    diataxis: explanation
+    summary: Understand what Kylo can remember, how the Wiki connects ideas, and how memory supports chats, contacts, and agents.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/MemoryView.tsx
+      - kylo/ui/web/memory_vault_routes.py
+      - kylo/memory/wiki/vault_model.py
+      - kylo/ui/web/wiki_routes.py
+      - kylo/memory/wiki/integration.py
+      - kylo/memory/wiki/curator.py
+      - docs/adr/0013-knowledge-wiki-architecture.md
+    related:
+      - profile-and-contacts
+      - connect-obsidian
+      - jarvis-agents
+      - privacy-and-local-data
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Knowledge and sharing
+    section_order: 4
+    order: 2
+    slug: connect-obsidian
+    file: docs/product/knowledge-and-sharing/connect-obsidian.md
+    title: Connect an Obsidian Vault
+    diataxis: howto
+    summary: Use an existing Obsidian vault as a readable knowledge source while keeping file ownership and backups clear.
+    authoritative_sources:
+      - docs/obsidian-setup.md
+      - kylo/ui/web/frontend/src/components/wiki/ObsidianSetupDialog.tsx
+      - kylo/ui/web/frontend/src/components/wiki/ObsidianStatus.tsx
+      - kylo/memory/wiki/vault_root.py
+      - kylo/memory/wiki/watcher.py
+    related:
+      - wiki-and-memory
+      - privacy-and-local-data
+      - troubleshooting
+    reader_level: advanced
+    maturity: stable
+
+  - section: Knowledge and sharing
+    section_order: 4
+    order: 3
+    slug: jarvis-board
+    file: docs/product/knowledge-and-sharing/kylo-board.md
+    title: Kylo Board
+    diataxis: explanation
+    summary: Explore personal activity, achievements, and optional sharing, including what data leaves the device.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/BoardView.tsx
+      - kylo/ui/web/board_routes.py
+      - kylo/board/aggregator.py
+      - kylo/board/sync.py
+      - docs/kylo-board/ARCHITECTURE.md
+    related:
+      - profile-and-contacts
+      - socials-and-feedback
+      - privacy-and-local-data
+    reader_level: intermediate
+    maturity: experimental
+
+  - section: Knowledge and sharing
+    section_order: 4
+    order: 4
+    slug: socials-and-feedback
+    file: docs/product/knowledge-and-sharing/socials-and-feedback.md
+    title: Social Links and Feedback
+    diataxis: howto
+    summary: Find official community links and share useful feedback without accidentally including private information.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/socials/SocialsView.tsx
+      - kylo/ui/web/frontend/src/views/feedback/FeedbackView.tsx
+      - kylo/ui/web/socials_routes.py
+      - kylo/ui/web/feedback_routes.py
+    related:
+      - profile-and-contacts
+      - jarvis-board
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Knowledge and sharing
+    section_order: 4
+    order: 5
+    slug: find-help-in-the-app
+    file: docs/product/knowledge-and-sharing/find-help-in-the-app.md
+    title: Find Help in the App
+    diataxis: howto
+    summary: Search the built-in documentation, use related-page links, and move between overview, guides, troubleshooting, and reference material.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/DocsView.tsx
+      - kylo/ui/web/frontend/src/components/docs/DocsOverview.tsx
+      - kylo/ui/web/frontend/src/components/docs/DocsSearchModal.tsx
+      - kylo/ui/web/docs_routes.py
+      - kylo/docs/registry.py
+    related:
+      - desktop-app-tour
+      - troubleshooting
+      - app-command-reference
+    reader_level: beginner
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 1
+    slug: jarvis-agents
+    file: docs/product/extend-and-automate/kylo-agents.md
+    title: Kylo-Agents
+    diataxis: explanation
+    summary: Learn when Kylo delegates longer work, how missions and workers fit together, and how to follow progress and results.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/KyloAgentsView.tsx
+      - kylo/ui/web/missions_routes.py
+      - kylo/missions/manager.py
+      - kylo/missions/state_machine.py
+    related:
+      - tasks-and-reminders
+      - outputs-and-files
+      - skills
+      - safety-and-approvals
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 2
+    slug: skills
+    file: docs/product/extend-and-automate/skills.md
+    title: Skills
+    diataxis: explanation
+    summary: Understand how a skill gives Kylo repeatable instructions, when it runs, and how drafts differ from enabled skills.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/SkillsView.tsx
+      - kylo/ui/web/skills_routes.py
+      - kylo/skills/registry.py
+      - kylo/skills/lifecycle.py
+      - kylo/skills/runner.py
+    related:
+      - plugins
+      - mcp-connections
+      - jarvis-agents
+      - safety-and-approvals
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 3
+    slug: plugins
+    file: docs/product/extend-and-automate/plugins.md
+    title: Plugins
+    diataxis: explanation
+    summary: Connect packaged capabilities, understand sign-in and health states, and see how plugins can expose tools and skills.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/PluginsView.tsx
+      - kylo/ui/web/marketplace_routes.py
+      - kylo/marketplace/plugin_registry.py
+      - kylo/marketplace/plugin_loader.py
+      - kylo/marketplace/plugin_mcp.py
+    related:
+      - skills
+      - mcp-connections
+      - providers-and-api-keys
+      - credentials-and-secrets
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 4
+    slug: mcp-connections
+    file: docs/product/extend-and-automate/mcp-connections.md
+    title: MCP Connections
+    diataxis: howto
+    summary: Add and inspect Model Context Protocol servers, then understand how their tools become available safely.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/McpsView.tsx
+      - kylo/ui/web/mcp_routes.py
+      - kylo/mcp/registry.py
+      - kylo/mcp/client.py
+      - mcp.json.example
+    related:
+      - plugins
+      - skills
+      - credentials-and-secrets
+      - safety-and-approvals
+    reader_level: advanced
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 5
+    slug: cli-connections
+    file: docs/product/extend-and-automate/cli-connections.md
+    title: CLI Connections
+    diataxis: howto
+    summary: Let Kylo discover command-line tools, check their readiness, and use only the capabilities available on the current computer.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/ClisView.tsx
+      - kylo/ui/web/cli_routes.py
+      - kylo/clis/registry.py
+      - kylo/clis/prober.py
+      - kylo/clis/risk_integration.py
+    related:
+      - skills
+      - workflows-and-commands
+      - cli-reference
+      - safety-and-approvals
+    reader_level: advanced
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 6
+    slug: computer-use
+    file: docs/product/extend-and-automate/computer-use.md
+    title: Computer Use
+    diataxis: howto
+    summary: Understand how Kylo sees and operates desktop apps, when it asks for confirmation, and how to stop or recover a run.
+    authoritative_sources:
+      - docs/computer-use.md
+      - kylo/plugins/tool/computer_use_tool.py
+      - kylo/harness/native_computer_use.py
+      - kylo/vision/engine.py
+      - kylo/safety/vision_telemetry.py
+    related:
+      - permissions
+      - safety-and-approvals
+      - jarvis-agents
+      - platform-support
+    reader_level: advanced
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 7
+    slug: workflows-and-commands
+    file: docs/product/extend-and-automate/workflows-and-commands.md
+    title: Workflows and App Commands
+    diataxis: explanation
+    summary: See how reusable workflows, natural-language actions, REST routes, and CLI commands connect to the same underlying capability.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/WorkflowsView.tsx
+      - kylo/ui/web/workflows_routes.py
+      - kylo/workflows/runner.py
+      - kylo/commands/registry.py
+      - docs/commands-reference.md
+    related:
+      - tasks-and-reminders
+      - skills
+      - cli-reference
+      - app-command-reference
+    reader_level: advanced
+    maturity: experimental
+    source_policy: Link to docs/commands-reference.md; do not copy its generated command catalog.
+
+  - section: Extend and automate
+    section_order: 5
+    order: 8
+    slug: agentic-ide
+    file: docs/product/extend-and-automate/agentic-ide.md
+    title: Agentic IDE
+    diataxis: howto
+    summary: Open a project workspace, coordinate coding agents in live terminal panes, and keep every instruction and result visible.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/AgenticIdeView.tsx
+      - kylo/ui/web/frontend/src/components/agentic/AgenticGrid.tsx
+      - kylo/ui/web/agentic_ide_routes.py
+      - kylo/agentic_ide/session.py
+      - kylo/agentic_ide/resume_store.py
+      - kylo/agentic_ide/notifications.py
+      - kylo/workspace/trust.py
+    related:
+      - cli-connections
+      - jarvis-agents
+      - cli-reference
+      - safety-and-approvals
+    reader_level: intermediate
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 9
+    slug: screen-context
+    file: docs/product/extend-and-automate/screen-context.md
+    title: Screen Context
+    diataxis: howto
+    summary: Let your assistant inspect one requested screen or window with visible capture, privacy filtering, and short-lived memory.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/AppshotsView.tsx
+      - kylo/ui/web/screen_context_routes.py
+      - kylo/screen_context/service.py
+      - kylo/screen_context/intent.py
+      - kylo/screen_context/targeting.py
+      - kylo/screen_context/redaction.py
+      - kylo/screen_context/ports.py
+    related:
+      - computer-use
+      - permissions
+      - providers-and-api-keys
+      - cli-reference
+    reader_level: beginner
+    maturity: stable
+
+  - section: Extend and automate
+    section_order: 5
+    order: 10
+    slug: connect-home-assistant
+    file: docs/product/extend-and-automate/connect-home-assistant.md
+    title: Connect Home Assistant
+    diataxis: howto
+    summary: Connect a self-hosted Home Assistant, protect its long-lived token, and use approved smart-home reads and actions safely.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/PluginsView.tsx
+      - kylo/ui/web/marketplace_routes.py
+      - kylo/marketplace/seed_catalog.json
+      - kylo/marketplace/usage_cards/home_assistant.md
+      - kylo/plugins/tool/home_assistant_rest.py
+    related:
+      - plugins
+      - skills
+      - workflows-and-commands
+      - credentials-and-secrets
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 1
+    slug: privacy-and-local-data
+    file: docs/product/privacy-safety-and-support/privacy-and-local-data.md
+    title: Privacy and Local Data
+    diataxis: explanation
+    summary: Learn what Kylo stores locally, what may be sent to a connected service, and how each optional feature changes that boundary.
+    authoritative_sources:
+      - AGENTS.md
+      - kylo/core/paths.py
+      - kylo/core/redact.py
+      - kylo/state/chat_store.py
+      - kylo/memory/wiki/secret_guard.py
+    related:
+      - credentials-and-secrets
+      - permissions
+      - wiki-and-memory
+      - jarvis-board
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 2
+    slug: credentials-and-secrets
+    file: docs/product/privacy-safety-and-support/credentials-and-secrets.md
+    title: Credentials and Secrets
+    diataxis: explanation
+    summary: Understand how credentials are entered, stored, redacted, replaced, and kept out of conversations and documentation.
+    authoritative_sources:
+      - kylo/core/config.py
+      - kylo/core/control_key.py
+      - kylo/core/redact.py
+      - kylo/marketplace/token_store.py
+      - kylo/memory/wiki/secret_guard.py
+    related:
+      - providers-and-api-keys
+      - privacy-and-local-data
+      - control-key
+      - troubleshooting
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 3
+    slug: permissions
+    file: docs/product/privacy-safety-and-support/permissions.md
+    title: App Permissions
+    diataxis: howto
+    summary: See when macOS asks for microphone, screen, accessibility, and input access, and how to change an answer later.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/lib/permissionToast.ts
+      - kylo/ui/web/frontend/src/i18n/locales/en.json
+      - kylo/cli_ctl/commands/permissions.py
+      - kylo/core/macos_privacy_strings.py
+      - kylo/ui/web/permissions_routes.py
+      - kylo/platform/permissions.py
+      - kylo/platform/permission_service.py
+      - kylo/platform/capabilities.py
+    related:
+      - first-run-setup
+      - audio-and-wake-word
+      - computer-use
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 4
+    slug: safety-and-approvals
+    file: docs/product/privacy-safety-and-support/safety-and-approvals.md
+    title: Safety and Approvals
+    diataxis: explanation
+    summary: Learn why some actions run immediately, some require confirmation, and some are blocked before they can affect your computer or accounts.
+    authoritative_sources:
+      - AGENTS.md
+      - kylo/safety/risk_tier.py
+      - kylo/safety/approval.py
+      - kylo/safety/tool_executor.py
+      - kylo/missions/tool_approvals.py
+    related:
+      - computer-use
+      - tasks-and-reminders
+      - skills
+      - privacy-and-local-data
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 5
+    slug: troubleshooting
+    file: docs/product/privacy-safety-and-support/troubleshooting.md
+    title: Troubleshooting
+    diataxis: troubleshooting
+    summary: Diagnose startup, connection, provider, voice, permission, and extension problems using safe checks before changing configuration.
+    authoritative_sources:
+      - docs/README-desktop-black-screen.md
+      - kylo/diagnostics/doctor.py
+      - kylo/ui/web/diagnostics_routes.py
+    related:
+      - install-kylo
+      - providers-and-api-keys
+      - audio-and-wake-word
+      - platform-support
+    reader_level: beginner
+    maturity: stable
+
+  - section: Privacy, safety, and support
+    section_order: 6
+    order: 6
+    slug: control-key
+    file: docs/product/privacy-safety-and-support/control-key.md
+    title: "Your Assistant's Key (Control Key)"
+    diataxis: howto
+    summary: Find, use, replace, and regenerate the one key that unlocks Kylo in a browser and authenticates local agents.
+    authoritative_sources:
+      - kylo/core/control_key.py
+      - kylo/ui/web/control_routes.py
+      - kylo/ui/web/surface_security.py
+      - kylo/ui/web/frontend/src/views/settings/KyloApiGroup.tsx
+      - kylo/ui/web/frontend/src/components/AuthGate.tsx
+    related:
+      - credentials-and-secrets
+      - control-api-reference
+      - providers-and-api-keys
+      - troubleshooting
+    reader_level: beginner
+    maturity: stable
+
+  - section: Reference
+    section_order: 7
+    order: 1
+    slug: cli-reference
+    file: docs/product/reference/cli-reference.md
+    title: CLI Reference
+    diataxis: reference
+    summary: Find the supported command-line surfaces, authentication options, common flags, and the generated command catalog.
+    authoritative_sources:
+      - docs/kylo-cli.md
+      - docs/kylo-cli-reference.md
+      - docs/reference/kylo-cli.md
+      - kylo/cli_ctl
+      - scripts/ci/gen_cli_reference.py
+    related:
+      - cli-connections
+      - control-api-reference
+      - app-command-reference
+      - configuration-reference
+    reader_level: advanced
+    maturity: stable
+    source_policy: Link to docs/kylo-cli-reference.md; do not copy or hand-edit its generated command catalog.
+
+  - section: Reference
+    section_order: 7
+    order: 2
+    slug: control-api-reference
+    file: docs/product/reference/control-api-reference.md
+    title: Control API Reference
+    diataxis: reference
+    summary: Understand API authentication, discovery, error behavior, and how REST operations map to CLI and in-app actions.
+    authoritative_sources:
+      - docs/kylo-control-api.md
+      - kylo/ui/web/server.py
+      - kylo/ui/web/control_routes.py
+      - kylo/ui/web/surface_security.py
+      - kylo/core/control_key.py
+    related:
+      - cli-reference
+      - app-command-reference
+      - credentials-and-secrets
+      - architecture
+    reader_level: advanced
+    maturity: stable
+
+  - section: Reference
+    section_order: 7
+    order: 3
+    slug: configuration-reference
+    file: docs/product/reference/configuration-reference.md
+    title: Configuration Reference
+    diataxis: reference
+    summary: Look up supported settings, defaults, environment overrides, and safe configuration-write behavior.
+    authoritative_sources:
+      - kylo/core/config.py
+      - kylo/core/config_writer.py
+      - pyproject.toml
+      - kylo/ui/web/settings_routes.py
+      - kylo/ui/web/provider_spec.py
+    related:
+      - settings-and-appearance
+      - providers-and-api-keys
+      - credentials-and-secrets
+      - platform-support
+    reader_level: advanced
+    maturity: stable
+
+  - section: Reference
+    section_order: 7
+    order: 4
+    slug: app-command-reference
+    file: docs/product/reference/app-command-reference.md
+    title: App Command Reference
+    diataxis: reference
+    summary: Learn how to browse the canonical app-command catalog shared by voice, chat, desktop, CLI, and REST surfaces.
+    authoritative_sources:
+      - docs/commands-reference.md
+      - kylo/commands/registry.py
+      - kylo/ui/web/commands_routes.py
+      - scripts/ci/gen_commands_reference.py
+    related:
+      - workflows-and-commands
+      - cli-reference
+      - control-api-reference
+    reader_level: advanced
+    maturity: stable
+    source_policy: Link to docs/commands-reference.md; never duplicate or hand-maintain the generated entries.
+
+  - section: Reference
+    section_order: 7
+    order: 5
+    slug: architecture
+    file: docs/product/reference/architecture.md
+    title: How Kylo Fits Together
+    diataxis: explanation
+    summary: Follow a request from the user interface through providers, tools, safety checks, events, agents, memory, and output.
+    authoritative_sources:
+      - docs/architecture-overview.md
+      - kylo/core/protocols.py
+      - kylo/core/bus.py
+      - kylo/brain/factory.py
+      - pyproject.toml
+    related:
+      - providers-and-api-keys
+      - jarvis-agents
+      - safety-and-approvals
+      - control-api-reference
+    reader_level: advanced
+    maturity: stable
+
+  - section: Reference
+    section_order: 7
+    order: 6
+    slug: platform-support
+    file: docs/product/reference/platform-support.md
+    title: Platform Support and Requirements
+    diataxis: reference
+    summary: Check operating-system support, optional hardware and audio capabilities, headless behavior, and graceful feature fallbacks.
+    authoritative_sources:
+      - pyproject.toml
+      - install/README.md
+      - install/install.ps1
+      - install/install.sh
+      - kylo/platform/capabilities.py
+    related:
+      - install-kylo
+      - permissions
+      - configuration-reference
+      - troubleshooting
+    reader_level: advanced
+    maturity: stable
+
+  - section: Everyday use
+    section_order: 2
+    order: 10
+    slug: costs
+    file: docs/product/everyday-use/costs.md
+    title: Spend & Tokens
+    diataxis: howto
+    summary: Understand recorded usage, compare providers, and trace spending to individual runs.
+    authoritative_sources:
+      - kylo/ui/web/frontend/src/views/CostsView.tsx
+      - kylo/ui/web/costs_routes.py
+    related:
+      - tasks-and-reminders
+      - jarvis-agents
+      - providers-and-api-keys
+    reader_level: beginner
+    maturity: stable

@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Land a coding agent's finished branch: rebase, self-check, push.
+
+One command for every agent (Claude Code, Codex, Gemini CLI, ...) working in
+its own worktree or clone::
+
+    python scripts/agent_land.py            # on a feature branch -> PR, auto-merge
+    python scripts/agent_land.py --direct   # admin only: fast-forward main itself
+
+What it does, in order — and it stops at the first real problem:
+
+1. **Rebase** the branch onto the latest ``<remote>/main``. Generated files
+   (frontend dist, reference docs, lockfiles) and append-only
+   files (CHANGELOG) are resolved automatically; anything else is listed for
+   the agent to resolve (or handed to ``--resolver-cmd``).
+2. **Static gates** — ``scripts/ci/run_gates.py``, the same set CI runs.
+3. **Relevant tests** — ``scripts/ci/select_tests.py`` picks the test files
+   the diff can affect and ``scripts/ci/run_tests_parallel.py`` runs them in
+   isolated processes. The full suite runs in CI.
+4. **Push** — a feature branch gets a pull request labelled ``auto-merge``
+   with GitHub's auto-merge requested: once the CI gate is green GitHub adds
+   it to the merge queue by itself. The merge train keeps it current.
+
+It never stashes, never force-pushes, and refuses a dirty worktree: the main
+checkout is shared with other sessions, so this belongs in your own worktree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ci import agent_integrate, merge_freeze  # noqa: E402
+from scripts.ci.select_tests import SMOKE  # noqa: E402
+
+PY = sys.executable
+
+
+def run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=check,
+    )
+
+
+def step(title: str) -> None:
+    print(f"\n== {title}", flush=True)
+
+
+def wants_queue(pull_request: dict) -> bool:
+    """Whether a pull request may be queued on green: open for merging and not opted out."""
+    labels = {str(label.get("name", "")) for label in pull_request.get("labels") or []}
+    return not pull_request.get("isDraft") and not labels & agent_integrate.OPT_OUT_LABELS
+
+
+def queue_when_green(branch: str, runner=run) -> bool:
+    """Ask GitHub to add the pull request to the merge queue once its checks pass.
+
+    The merge train enqueues only with its bot token; without one a green pull
+    request waits until a person adds it by hand. Auto-merge is requested with
+    the agent's own login, so the queue's ``merge_group`` run starts normally.
+    Never blocking: a refusal leaves the pull request to the train.
+    """
+    view = runner(["gh", "pr", "view", branch, "--json", "number,isDraft,labels"])
+    try:
+        pull_request = json.loads(view.stdout or "null") if view.returncode == 0 else None
+    except ValueError:
+        pull_request = None
+    if not isinstance(pull_request, dict):
+        print("Could not read the pull request; the merge train lands it when green.")
+        return False
+    if not wants_queue(pull_request):
+        print("Draft or opted out: not asking GitHub to queue it.")
+        return False
+    freeze = active_freeze(pull_request, runner)
+    if freeze is not None:
+        print(f"Not requesting auto-merge: {merge_freeze.describe(freeze)}.")
+        print("Run this script again once the freeze is lifted.")
+        return False
+    asked = runner(["gh", "pr", "merge", branch, "--auto", "--squash"])
+    if asked.returncode != 0:
+        print("GitHub did not accept auto-merge; the merge train lands it when green.")
+        print((asked.stdout + asked.stderr).strip())
+        return False
+    print(f"PR #{pull_request.get('number')} joins the merge queue by itself once CI is green.")
+    return True
+
+
+def active_freeze(pull_request: dict, runner=run) -> merge_freeze.Freeze | None:
+    """The merge freeze another pull request holds on main, if any (never blocking)."""
+    repo = runner(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+    if repo.returncode != 0 or not repo.stdout.strip():
+        return None
+
+    def gh_json(args: list[str]) -> object:
+        out = runner(["gh", *args])
+        try:
+            return json.loads(out.stdout or "null") if out.returncode == 0 else None
+        except ValueError:
+            return None
+
+    number = pull_request.get("number")
+    return merge_freeze.active_freeze(
+        repo.stdout.strip(), gh_json, exempt=int(number) if number else None
+    )
+
+
+def report_gate() -> None:
+    """Print what the agent done gate says now, so the next step is in view."""
+    step("next: the agent done gate")
+    gate = run([PY, "scripts/agent_done_gate.py"])
+    print((gate.stdout + gate.stderr).strip() or "The gate gave no answer.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--direct", action="store_true", help="Push straight to main.")
+    parser.add_argument(
+        "--pr",
+        action="store_true",
+        help="Accepted for compatibility: a feature branch always lands through a PR.",
+    )
+    parser.add_argument("--skip-tests", action="store_true")
+    parser.add_argument("--skip-gates", action="store_true")
+    parser.add_argument("--no-push", action="store_true", help="Check only.")
+    parser.add_argument(
+        "--resolver-cmd",
+        default=os.environ.get("CONFLICT_RESOLVER_CMD", ""),
+        help="Command that edits conflicted files in place (prompt on stdin).",
+    )
+    args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=True).stdout.strip()
+    if branch == "main" and not args.direct:
+        print("Refusing to land from main: local main mirrors origin/main and takes no commits.")
+        print("Work on a feature branch in your own worktree:")
+        print("  git worktree add -b <agent>/<topic> <path> origin/main")
+        return 2
+    direct = args.direct
+    dirty = run(["git", "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty:
+        print("Refusing to land: the worktree has uncommitted changes to tracked files.")
+        print("Commit your own paths first (git commit -- <paths>); never stash here.")
+        return 2
+    upstream = f"{args.remote}/main"
+
+    step(f"1/4 rebase {branch} onto {upstream}")
+    if run(["git", "fetch", "--quiet", args.remote, "main"]).returncode != 0:
+        print(f"Could not fetch {upstream}.")
+        return 2
+    if run(["git", "merge-base", "HEAD", upstream]).returncode != 0:
+        # The history was rewritten once (2026-10-27); a branch cut before
+        # that shares no commit with main, and a rebase would replay all of it.
+        print(f"{branch} shares no history with {upstream} (cut before the 2026-10-27 rewrite).")
+        print("Move it onto the new history first:  python scripts/rehome_branch.py")
+        return 2
+    report = agent_integrate.update(upstream, "rebase", args.resolver_cmd, REPO_ROOT)
+    print(report)
+    if report["status"] == "conflict":
+        print("\nThese files conflict and need a human-quality resolution:")
+        for path in report.get("unresolved", []):  # type: ignore[union-attr]
+            print(f"  - {path}")
+        # A branch that predates the package move stops at the commit before
+        # it; one already carried across the move holds a merge a rebase drops.
+        target = report.get("onto", upstream)
+        verb = "merge" if report.get("package_move") else "rebase"
+        print(
+            f"\nRun `git {verb} {target}`, resolve them (keep both sides' intent), "
+            f"`git add` them, `git {verb} --continue`, then run this script again."
+        )
+        return 3
+
+    if not args.skip_gates:
+        step("2/4 static gates")
+        gates = subprocess.run(  # noqa: S603
+            [PY, "scripts/ci/run_gates.py", "--base", upstream, "--pr"], cwd=REPO_ROOT, check=False
+        )
+        if gates.returncode != 0:
+            print("A static gate failed - fix it before landing.")
+            return 4
+
+    if not args.skip_tests:
+        step("3/4 relevant tests")
+        changed = run(["git", "diff", "--name-only", f"{upstream}...HEAD"]).stdout
+        with tempfile.TemporaryDirectory(prefix="agent-land-") as tmp:
+            changed_file = Path(tmp) / "changed.txt"
+            selected = Path(tmp) / "selected.txt"
+            changed_file.write_text(changed, encoding="utf-8")
+            sel = run(
+                [
+                    PY,
+                    "scripts/ci/select_tests.py",
+                    "--changed-from",
+                    str(changed_file),
+                    "--out",
+                    str(selected),
+                ]
+            )
+            print(sel.stdout.strip())
+            files = [x for x in selected.read_text(encoding="utf-8").splitlines() if x]
+            if "mode=all" in sel.stdout:
+                print("The change reaches the whole suite; running the contract guards here.")
+                files = list(SMOKE)
+                selected.write_text("\n".join(files) + "\n", encoding="utf-8")
+            if files:
+                tests = subprocess.run(  # noqa: S603
+                    [
+                        PY,
+                        "scripts/ci/run_tests_parallel.py",
+                        "--files-from",
+                        str(selected),
+                        "--report",
+                        str(Path(tmp) / "report.json"),
+                        "--junit-out",
+                        str(Path(tmp) / "report.xml"),
+                    ],
+                    cwd=REPO_ROOT,
+                    check=False,
+                )
+                if tests.returncode != 0:
+                    print(
+                        "Relevant tests failed. If a failure is pre-existing on main, it is in "
+                        "scripts/ci/test-baseline-*.json and CI will not block on it."
+                    )
+                    return 5
+            else:
+                print("No test can see this change.")
+
+    if args.no_push:
+        print("\nChecks passed; --no-push given, nothing pushed.")
+        return 0
+    step("4/4 push")
+    if direct:
+        push = run(["git", "push", args.remote, "HEAD:main"])
+        print(push.stdout + push.stderr)
+        if push.returncode != 0:
+            print("main moved while checking - run this script again (it rebases first).")
+            return 6
+        return 0
+    push = run(["git", "push", "--set-upstream", args.remote, f"HEAD:refs/heads/{branch}"])
+    print(push.stdout + push.stderr)
+    if push.returncode != 0:
+        print("Push rejected. Never force it: pull, re-run this script.")
+        return 6
+    existing = run(["gh", "pr", "view", branch, "--json", "number", "-q", ".number"])
+    if existing.returncode == 0 and existing.stdout.strip():
+        print(f"PR #{existing.stdout.strip()} updated.")
+        queue_when_green(branch)
+        report_gate()
+        return 0
+    created = run(["gh", "pr", "create", "--fill", "--base", "main", "--label", "auto-merge"])
+    print(created.stdout + created.stderr)
+    if created.returncode != 0:
+        return 7
+    queue_when_green(branch)
+    report_gate()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

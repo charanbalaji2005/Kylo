@@ -1,0 +1,267 @@
+"""The shape of a composed prompt, and what each task kind asks for.
+
+The writer's system prompt is a contract, not a lecture: the output shape,
+the handover/back-reference facts, goal-not-implementation, and one line per
+task kind. ``@path`` hygiene is enforced by the composer, not by the prompt.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from kylo.agentic_ide.prompt_blueprint import (
+    MAX_BODY_CHARS,
+    TARGET_MAX_CHARS,
+    ends_on_reference,
+    looks_truncated,
+    render_fallback,
+    system_prompt,
+    user_block,
+)
+from kylo.agentic_ide.task_kind import (
+    KIND_IMPLEMENT,
+    KIND_INVESTIGATE,
+    KIND_NEUTRAL,
+    KIND_QUESTION,
+    KIND_REVIEW,
+)
+
+_ALL_KINDS = (
+    KIND_IMPLEMENT,
+    KIND_REVIEW,
+    KIND_INVESTIGATE,
+    KIND_QUESTION,
+    KIND_NEUTRAL,
+)
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_every_kind_demands_english_output(kind):
+    assert "english" in system_prompt(kind).lower()
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_every_kind_demands_the_markdown_skeleton(kind):
+    text = system_prompt(kind)
+    assert "## Task" in text
+    assert "## Key files" in text
+    assert "## Done when" in text
+    # A lean brief: the agent opens the @files itself.
+    assert "## How it works today" not in text
+    assert "## Why this matters" not in text
+    assert "## Scope" not in text
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_every_kind_forbids_inventing_requirements(kind):
+    assert "only outcomes the user stated" in system_prompt(kind)
+
+
+def test_only_the_task_section_is_mandatory():
+    for kind in _ALL_KINDS:
+        assert "`## Task` is required" in system_prompt(kind)
+
+
+def test_review_asks_for_every_finding():
+    text = system_prompt(KIND_REVIEW)
+    assert "Kind: review" in text
+    assert "every finding" in text
+    assert "filtered later" in text
+
+
+def test_investigate_makes_the_diagnosis_the_deliverable():
+    text = system_prompt(KIND_INVESTIGATE)
+    assert "Kind: investigation" in text
+    assert "cause and its evidence" in text
+    assert "no fix" in text
+
+
+def test_implement_states_the_outcome_not_the_route():
+    text = system_prompt(KIND_IMPLEMENT)
+    assert "Kind: implementation." in text
+    assert "not an implementation" in text
+
+
+def test_question_forbids_changing_anything():
+    text = system_prompt(KIND_QUESTION)
+    assert "Kind: question" in text
+    assert "nothing is changed" in text
+
+
+def test_neutral_carries_only_the_universally_safe_steers():
+    text = system_prompt(KIND_NEUTRAL)
+    assert "Kind: unclear" in text
+    # It must not claim a kind it does not know.
+    assert "Kind: review" not in text
+    assert "Kind: implementation" not in text
+
+
+def test_user_block_carries_the_skeletons_and_the_house_rules():
+    block = user_block(
+        utterance="tell Alex to check the ranking",
+        instruction="check the ranking",
+        terminal_name="Alex",
+        agent_display="Claude Code",
+        profile_lines=["Folder: /repo", "Git repository on branch main"],
+        candidates=["kylo/rank.py"],
+        skeletons={"kylo/rank.py": "def fuse(a, b) -> list: ..."},
+        house_rules="Tests: pytest tests/",
+    )
+
+    assert "Alex" in block
+    assert "Claude Code" in block
+    assert "kylo/rank.py" in block
+    assert "def fuse(a, b) -> list: ..." in block
+    assert "pytest tests/" in block
+    assert "tell Alex to check the ranking" in block
+
+
+def test_user_block_puts_the_request_after_the_longform_data():
+    """Queries at the end measurably improve multi-document performance."""
+    block = user_block(
+        utterance="do the thing",
+        instruction="do the thing",
+        terminal_name="Dana",
+        agent_display="Codex",
+        profile_lines=["Folder: /repo"],
+        candidates=["a.py"],
+        skeletons={"a.py": "def f(): ..."},
+        house_rules="",
+    )
+
+    assert block.index("FILE OUTLINES") < block.index("WHAT THE USER SAID")
+    assert block.rstrip().endswith("Write the prompt now.")
+
+
+def test_user_block_carries_the_workspace_tree_as_the_file_map():
+    """The writer picks @files from the tree, not from five lexical hits."""
+    block = user_block(
+        utterance="the terminal prompt is too slow",
+        instruction="the terminal prompt is too slow",
+        terminal_name="T4",
+        agent_display="Claude Code",
+        profile_lines=["Folder: /repo"],
+        candidates=["kylo/agentic_ide/prompt_history.py"],
+        skeletons={},
+        house_rules="",
+        tree="kylo/agentic_ide/  prompt_composer.py  file_index.py  session.py",
+    )
+
+    assert "WORKSPACE TREE" in block
+    assert "prompt_composer.py" in block
+    assert "SPOKEN WORDS ALREADY POINTED AT" in block
+    assert "use only these in @references" not in block
+    assert block.index("WORKSPACE TREE") < block.index("WHAT THE USER SAID")
+
+
+def test_user_block_survives_having_nothing_to_offer():
+    block = user_block(
+        utterance="do the thing",
+        instruction="do the thing",
+        terminal_name="Dana",
+        agent_display="Codex",
+        profile_lines=[],
+        candidates=[],
+        skeletons={},
+        house_rules="",
+    )
+
+    assert "do the thing" in block
+    assert "Dana" in block
+
+
+def test_fallback_renders_markdown_with_a_task_heading():
+    out = render_fallback("review the ranking pipeline", ["a.py", "b.py"])
+
+    assert out.startswith("## Task")
+    assert "review the ranking pipeline" in out
+    assert "## Key files" in out
+    assert "`@a.py`" in out
+    assert "`@b.py`" in out
+
+
+def test_fallback_without_files_omits_the_key_files_section():
+    out = render_fallback("review the ranking pipeline", [])
+
+    assert "## Key files" not in out
+    assert "review the ranking pipeline" in out
+
+
+def test_fallback_never_ends_on_a_file_reference():
+    assert not ends_on_reference(render_fallback("check this", ["a.py"]))
+
+
+def test_fallback_of_an_empty_instruction_is_empty():
+    assert render_fallback("", ["a.py"]) == ""
+    assert render_fallback("   ", []) == ""
+
+
+def test_fallback_respects_the_body_bound():
+    out = render_fallback("x" * 5000, ["a.py"])
+
+    assert len(out) <= MAX_BODY_CHARS
+
+
+def test_ends_on_reference_detects_the_failure_shape():
+    assert ends_on_reference("do the thing @file.py")
+    assert ends_on_reference("run it /compact")
+    assert not ends_on_reference("do the thing @file.py and report back")
+    assert not ends_on_reference("")
+
+
+def test_the_target_length_sits_inside_the_hard_ceiling():
+    """The ceiling says what the fallback may hold; the target says what is good."""
+    assert TARGET_MAX_CHARS < MAX_BODY_CHARS
+    assert TARGET_MAX_CHARS == 1200
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_every_kind_states_the_target_length(kind):
+    assert str(TARGET_MAX_CHARS) in system_prompt(kind)
+
+
+@pytest.mark.parametrize("kind", _ALL_KINDS)
+def test_every_kind_asks_for_the_goal_and_not_the_implementation(kind):
+    """The writer sees bounded file outlines; the agent sees the code. A route
+    chosen from the outline is a guess, and a guessed route gets built."""
+    assert "not an implementation" in system_prompt(kind)
+
+
+def test_no_kind_tells_the_writer_to_keep_it_short():
+    """Brevity instructions are what produced the thin prompts."""
+    for kind in _ALL_KINDS:
+        assert "Keep it short" not in system_prompt(kind)
+
+
+# ------------------------------------------------------ truncation guard
+def test_a_brief_that_stops_mid_sentence_is_recognised():
+    """Measured live: an investigation brief ended on "...to find" and was
+    handed over as finished. Half a brief reads as a whole one."""
+    assert looks_truncated("## Task\nTrace the path through the pipeline to find")
+
+
+def test_a_finished_brief_is_not_flagged():
+    assert not looks_truncated("## Task\nReview the ranking pipeline.")
+    assert not looks_truncated("## Task\nDo it.\n\n## Key files\n- `@a.py` - here")
+    assert not looks_truncated("## Task\nCheck this:")
+
+
+def test_a_list_item_without_a_full_stop_is_not_truncation():
+    """The common shape of a finished Key files section — must not fire."""
+    assert not looks_truncated("## Task\nDo it.\n\n## Key files\n- `@a.py` - ranking")
+    assert not looks_truncated("## Task\nDo it.\n\n## Done when\n- The tests pass")
+
+
+def test_a_heading_left_dangling_is_not_treated_as_damage():
+    """Structural lines carry no punctuation by nature; only prose is judged."""
+    assert not looks_truncated("## Task\nDo it.\n\n## Scope")
+
+
+def test_unformatted_prose_that_finishes_properly_is_accepted():
+    """Formatting is the blueprint's job to demand, not this guard's to police."""
+    assert not looks_truncated("Review the ranking pipeline and report back.")
+
+
+def test_empty_output_counts_as_truncated():
+    assert looks_truncated("")
+    assert looks_truncated("   ")

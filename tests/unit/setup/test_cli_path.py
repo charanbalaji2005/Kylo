@@ -1,0 +1,448 @@
+"""PATH setup for the terminal commands (kylo/setup/cli_path.py), every OS."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from kylo.core.identity_migration import create_directory_link
+from kylo.setup import cli_path
+from kylo.setup.cli_path import (
+    COMMAND_NAMES,
+    PROFILE_MARKER,
+    add_profile_block,
+    add_to_user_path,
+    install_commands,
+    profile_file,
+    remove_commands,
+    remove_from_user_path,
+    remove_profile_block,
+)
+
+
+class FakeUserPath:
+    """Stands in for HKCU\\Environment so no test touches the real registry."""
+
+    def __init__(self, value: str = "", kind: int | None = None) -> None:
+        self.value = value
+        self.kind = kind
+        self.writes = 0
+
+    def read(self) -> tuple[str, int | None]:
+        return self.value, self.kind
+
+    def write(self, value: str, kind: int | None) -> None:
+        self.value, self.kind = value, kind
+        self.writes += 1
+
+
+def _never_found(*_args: object, **_kwargs: object) -> None:
+    return None
+
+
+@pytest.fixture
+def symlinks_available(tmp_path):
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path / "probe-target")
+    except OSError as exc:
+        pytest.skip(f"Host does not permit symlinks: {exc}")
+    probe.unlink()
+
+
+def _windows_root(tmp_path: Path) -> Path:
+    root = tmp_path / "install"
+    scripts = root / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    for command in COMMAND_NAMES:
+        (scripts / f"{command}.exe").write_bytes(b"launcher:" + command.encode())
+    return root
+
+
+def _posix_root(tmp_path: Path) -> Path:
+    root = tmp_path / "install"
+    venv_bin = root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    for command in COMMAND_NAMES:
+        (venv_bin / command).write_text("#!/bin/sh\n", encoding="utf-8")
+    return root
+
+
+# ------------------------------------------------------------------ profiles
+@pytest.mark.parametrize(
+    ("shell", "platform_name", "expected"),
+    [
+        ("/bin/zsh", "darwin", ".zshrc"),
+        ("/usr/bin/zsh", "linux", ".zshrc"),
+        ("/bin/bash", "darwin", ".bash_profile"),
+        ("/bin/bash", "linux", ".bashrc"),
+        ("/usr/bin/fish", "linux", ".config/fish/conf.d/personal-jarvis.fish"),
+        ("/bin/dash", "linux", ".profile"),
+        (None, "linux", ".profile"),
+    ],
+)
+def test_profile_matches_the_login_shell(tmp_path, shell, platform_name, expected):
+    found = profile_file(tmp_path, login_shell=shell, platform_name=platform_name)
+    assert found == tmp_path / expected
+
+
+def test_profile_block_is_added_once_and_removed_cleanly(tmp_path):
+    profile = tmp_path / ".zshrc"
+    profile.write_text("export EDITOR=vim", encoding="utf-8")  # no trailing newline
+    assert add_profile_block(profile) is True
+    assert add_profile_block(profile) is False
+    text = profile.read_text(encoding="utf-8")
+    assert text.count(PROFILE_MARKER) == 1
+    assert text.startswith("export EDITOR=vim\n")
+    assert '$HOME/.local/bin' in text
+
+    assert remove_profile_block(profile) is True
+    assert profile.read_text(encoding="utf-8") == "export EDITOR=vim\n"
+    assert remove_profile_block(profile) is False
+
+
+def test_fish_profile_uses_fish_syntax(tmp_path):
+    profile = profile_file(tmp_path, login_shell="fish", platform_name="linux")
+    add_profile_block(profile)
+    text = profile.read_text(encoding="utf-8")
+    assert "set -gx PATH" in text
+    assert "export" not in text
+
+
+# ---------------------------------------------------------- Windows user Path
+def test_user_path_append_is_idempotent_and_case_insensitive(tmp_path):
+    store = FakeUserPath(r"%USERPROFILE%\bin;C:\Tools", kind=2)
+    target = Path(r"C:\Users\Someone\.personal-jarvis\bin")
+    assert add_to_user_path(target, store) is True
+    assert store.value == r"%USERPROFILE%\bin;C:\Tools;" + str(target)
+    store.value = store.value.upper() + "\\"
+    assert add_to_user_path(target, store) is False
+    assert store.writes == 1
+    assert store.kind == 2
+
+
+def test_user_path_removal_keeps_other_entries():
+    target = Path(r"C:\j\bin")
+    store = FakeUserPath(r"C:\Tools;C:\j\bin;D:\other", kind=1)
+    assert remove_from_user_path(target, store) is True
+    assert store.value == r"C:\Tools;D:\other"
+    assert remove_from_user_path(target, store) is False
+
+
+def test_windows_install_copies_launchers_and_sets_path(tmp_path):
+    root = _windows_root(tmp_path)
+    store = FakeUserPath()
+    report = install_commands(
+        root, platform_name="win32", environ={"PATH": r"C:\Windows"}, store=store,
+        which=_never_found,
+    )
+    assert report.linked == list(COMMAND_NAMES)
+    for command in COMMAND_NAMES:
+        assert (root / "bin" / f"{command}.exe").read_bytes() == b"launcher:" + command.encode()
+    assert store.value == str(root / "bin")
+    assert report.path_updated is not None
+    assert report.needs_new_terminal is True
+
+
+def test_windows_repeat_install_leaves_identical_launchers_untouched(tmp_path):
+    root = _windows_root(tmp_path)
+    store = FakeUserPath()
+    install_commands(root, platform_name="win32", environ={}, store=store, which=_never_found)
+    copied = root / "bin" / "jarvis.exe"
+    before = copied.stat().st_mtime_ns
+    (root / ".venv" / "Scripts" / "jarvisctl.exe").write_bytes(b"launcher:new")
+
+    report = install_commands(
+        root, platform_name="win32", environ={"PATH": str(root / "bin")}, store=store,
+        which=_never_found,
+    )
+    assert copied.stat().st_mtime_ns == before
+    assert (root / "bin" / "jarvisctl.exe").read_bytes() == b"launcher:new"
+    assert store.writes == 1
+    assert report.path_updated is None
+    assert report.needs_new_terminal is False
+
+
+def test_windows_missing_entry_point_is_reported(tmp_path):
+    root = _windows_root(tmp_path)
+    (root / ".venv" / "Scripts" / "personal-jarvis.exe").unlink()
+    report = install_commands(
+        root, platform_name="win32", environ={}, store=FakeUserPath(), which=_never_found
+    )
+    assert report.missing == ["personal-jarvis"]
+    assert not (root / "bin" / "personal-jarvis.exe").exists()
+
+
+def test_windows_remove_only_touches_the_path(tmp_path):
+    root = _windows_root(tmp_path)
+    store = FakeUserPath(r"C:\Tools")
+    install_commands(root, platform_name="win32", environ={}, store=store, which=_never_found)
+    removed = remove_commands(root, platform_name="win32", home=tmp_path / "home", store=store)
+    assert store.value == r"C:\Tools"
+    assert len(removed) == 1
+
+
+def test_shadowing_command_is_reported(tmp_path):
+    root = _windows_root(tmp_path)
+    bin_dir = root / "bin"
+
+    def which(command: str, path: str | None = None) -> str:
+        return str(tmp_path / "elsewhere" / f"{command}.exe")
+
+    report = install_commands(
+        root, platform_name="win32", environ={"PATH": str(bin_dir)}, store=FakeUserPath(),
+        which=which,
+    )
+    assert set(report.shadowed_by) == set(COMMAND_NAMES)
+
+
+def test_dry_run_changes_nothing(tmp_path):
+    root = _windows_root(tmp_path)
+    store = FakeUserPath()
+    report = install_commands(
+        root, platform_name="win32", environ={}, store=store, which=_never_found, dry_run=True
+    )
+    assert report.linked == list(COMMAND_NAMES)
+    assert not (root / "bin").exists()
+    assert store.writes == 0
+
+
+# ------------------------------------------------------------- macOS / Linux
+@pytest.mark.parametrize("platform_name", ["darwin", "linux"])
+def test_posix_install_and_remove_round_trip(tmp_path, platform_name, symlinks_available):
+    root = _posix_root(tmp_path)
+    home = tmp_path / "home"
+    foreign = home / ".local" / "bin" / "jarvisctl"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("someone else's tool", encoding="utf-8")
+
+    report = install_commands(
+        root, platform_name=platform_name, home=home, environ={"PATH": "/usr/bin"},
+        login_shell="/bin/zsh", which=_never_found,
+    )
+    assert report.kept == ["jarvisctl"]
+    assert set(report.linked) == set(COMMAND_NAMES) - {"jarvisctl"}
+    assert report.path_updated == str(home / ".zshrc")
+
+    removed = remove_commands(root, platform_name=platform_name, home=home)
+    assert not (home / ".local" / "bin" / "jarvis").exists()
+    assert foreign.read_text(encoding="utf-8") == "someone else's tool"
+    assert PROFILE_MARKER not in (home / ".zshrc").read_text(encoding="utf-8")
+    assert any("PATH line" in line for line in removed)
+
+
+def test_posix_bin_dir_is_the_xdg_user_bin(tmp_path):
+    assert cli_path.bin_dir(tmp_path, platform_name="linux", home=tmp_path / "h") == (
+        tmp_path / "h" / ".local" / "bin"
+    )
+    assert cli_path.bin_dir(tmp_path, platform_name="win32") == tmp_path / "bin"
+
+
+def test_no_command_collides_with_the_branded_windows_launcher():
+    """Windows paths ignore case: a `personaljarvis` console script would be
+    the same file as the branded launcher that pip and the app both write."""
+    from kylo.core.instance import current_instance
+
+    branded = Path(current_instance().windows_branded_launcher_file_name).stem.casefold()
+    assert branded not in {command.casefold() for command in COMMAND_NAMES}
+
+
+def test_profile_removal_keeps_crlf_line_endings(tmp_path):
+    profile = tmp_path / ".profile"
+    profile.write_bytes(b"export A=1\r\nexport B=2\r\n")
+    add_profile_block(profile)
+    assert remove_profile_block(profile) is True
+    assert profile.read_bytes().startswith(b"export A=1\r\nexport B=2\r\n")
+    assert PROFILE_MARKER.encode() not in profile.read_bytes()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+# ------------------------------------------- installs made before a command existed
+#: What an earlier version wrote into a profile, byte for byte. The marker line
+#: names the commands of that time; it is how the block is found again.
+_EARLIER_COMMANDS = ("jarvis", "personal-jarvis", "jarvisctl")
+_EARLIER_POSIX_BLOCK = (
+    "\n# Personal Jarvis: command-line tools (jarvis, personal-jarvis)\n"
+    'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; '
+    '*) export PATH="$HOME/.local/bin:$PATH" ;; esac\n'
+)
+_EARLIER_FISH_BLOCK = (
+    "\n# Personal Jarvis: command-line tools (jarvis, personal-jarvis)\n"
+    "contains -- $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH\n"
+)
+
+
+def test_the_new_commands_are_on_the_list_beside_the_earlier_ones():
+    assert COMMAND_NAMES[:2] == ("kylo", "kyloctl")
+    assert set(_EARLIER_COMMANDS) < set(COMMAND_NAMES)
+
+
+def test_the_profile_marker_is_the_line_existing_profiles_carry():
+    # A changed marker would not be found in a profile an earlier install
+    # wrote: the next install would add a second block, and an uninstall would
+    # leave the first one behind.
+    assert _EARLIER_POSIX_BLOCK.splitlines()[1] == PROFILE_MARKER
+    assert _EARLIER_FISH_BLOCK.splitlines()[1] == PROFILE_MARKER
+
+
+@pytest.mark.parametrize(
+    ("shell", "platform_name", "block"),
+    [
+        ("/bin/zsh", "darwin", _EARLIER_POSIX_BLOCK),
+        ("/bin/bash", "linux", _EARLIER_POSIX_BLOCK),
+        ("/usr/bin/fish", "linux", _EARLIER_FISH_BLOCK),
+    ],
+)
+def test_an_earlier_install_gains_the_new_commands_and_keeps_one_profile_block(
+    tmp_path, shell, platform_name, block, symlinks_available
+):
+    root = _posix_root(tmp_path)
+    home = tmp_path / "home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    for command in _EARLIER_COMMANDS:
+        (bin_dir / command).symlink_to(root / ".venv" / "bin" / command)
+    profile = profile_file(home, login_shell=shell, platform_name=platform_name)
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    earlier_profile = "export EDITOR=vim\n" + block
+    profile.write_text(earlier_profile, encoding="utf-8", newline="\n")
+
+    for _run in range(2):  # the update, then any later installer run
+        report = install_commands(
+            root, platform_name=platform_name, home=home, environ={"PATH": "/usr/bin"},
+            login_shell=shell, which=_never_found,
+        )
+        assert report.errors == [] and report.kept == [] and report.missing == []
+        assert report.linked == list(COMMAND_NAMES)
+        # The block was there already: nothing is written, nothing duplicated.
+        assert report.path_updated is None
+        assert profile.read_text(encoding="utf-8") == earlier_profile
+    for command in COMMAND_NAMES:
+        assert (bin_dir / command).resolve() == (root / ".venv" / "bin" / command).resolve()
+
+    removed = remove_commands(root, platform_name=platform_name, home=home)
+
+    assert not any((bin_dir / command).is_symlink() for command in COMMAND_NAMES)
+    assert profile.read_text(encoding="utf-8") == "export EDITOR=vim\n"
+    assert any("PATH line" in line for line in removed)
+
+
+def test_an_earlier_windows_install_gains_the_new_launchers_without_touching_path(tmp_path):
+    root = _windows_root(tmp_path)
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    for command in _EARLIER_COMMANDS:
+        (bin_dir / f"{command}.exe").write_bytes(b"launcher:" + command.encode())
+    store = FakeUserPath(rf"C:\Tools;{bin_dir}", kind=2)
+
+    report = install_commands(
+        root, platform_name="win32", environ={"PATH": rf"C:\Windows;{bin_dir}"}, store=store,
+        which=_never_found,
+    )
+
+    assert report.linked == list(COMMAND_NAMES)
+    for command in COMMAND_NAMES:
+        assert (bin_dir / f"{command}.exe").read_bytes() == b"launcher:" + command.encode()
+    # The folder was on Path already: one entry, not two.
+    assert store.writes == 0 and report.path_updated is None
+    assert report.needs_new_terminal is False
+
+
+def test_a_headless_container_gets_every_command_and_a_profile_block(
+    tmp_path, symlinks_available
+):
+    # python:3.11-slim as root: no SHELL, no display, ~/.local/bin not on PATH.
+    root = _posix_root(tmp_path)
+    home = tmp_path / "root"
+
+    report = install_commands(
+        root, platform_name="linux", home=home,
+        environ={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(home)}, which=_never_found,
+    )
+
+    assert report.errors == [] and report.linked == list(COMMAND_NAMES)
+    for command in COMMAND_NAMES:
+        assert (home / ".local" / "bin" / command).is_symlink()
+    assert report.path_updated == str(home / ".profile")
+    assert (home / ".profile").read_text(encoding="utf-8").count(PROFILE_MARKER) == 1
+    assert report.needs_new_terminal is True
+
+
+# ------------------------------------------------- an install folder that moved
+def _moved_windows_install(tmp_path: Path) -> tuple[Path, Path]:
+    home = tmp_path / "home"
+    root = home / ".kylo"
+    scripts = root / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    for command in COMMAND_NAMES:
+        (scripts / f"{command}.exe").write_bytes(b"launcher:" + command.encode())
+    return home, root
+
+
+@pytest.mark.parametrize("legacy_state", ["absent", "link"])
+def test_the_earlier_install_folder_is_retired_once_it_is_no_install_of_its_own(
+    tmp_path, legacy_state
+):
+    home, root = _moved_windows_install(tmp_path)
+    if legacy_state == "link":
+        create_directory_link(home / ".personal-jarvis", root)
+
+    assert cli_path.retired_install_roots(root, home=home) == [home / ".personal-jarvis"]
+
+
+def test_a_real_folder_under_the_earlier_name_is_another_install_and_stays(tmp_path):
+    home, root = _moved_windows_install(tmp_path)
+    (home / ".personal-jarvis").mkdir()
+
+    assert cli_path.retired_install_roots(root, home=home) == []
+    # Nor is an install that still lives under the earlier name its own past.
+    assert cli_path.retired_install_roots(home / ".personal-jarvis", home=home) == []
+
+
+def test_a_moved_windows_install_swaps_its_path_entry(tmp_path):
+    home, root = _moved_windows_install(tmp_path)
+    old_bin = home / ".personal-jarvis" / "bin"
+    store = FakeUserPath(rf"C:\Tools;{old_bin}", kind=2)
+
+    report = install_commands(
+        root, platform_name="win32", home=home, environ={}, store=store, which=_never_found,
+        retired_roots=cli_path.retired_install_roots(root, home=home),
+    )
+
+    assert store.value == rf"C:\Tools;{root / 'bin'}"
+    assert store.kind == 2
+    assert report.path_retired == [str(old_bin)]
+    assert report.path_updated is not None
+
+    removed = remove_commands(
+        root, platform_name="win32", home=home, store=FakeUserPath(store.value + f";{old_bin}"),
+        retired_roots=[home / ".personal-jarvis"],
+    )
+    assert len(removed) == 2
+
+
+def test_a_posix_link_through_the_earlier_folder_name_is_pointed_at_the_folder(
+    tmp_path, symlinks_available
+):
+    home = tmp_path / "home"
+    root = home / ".kylo"
+    venv_bin = root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    for command in COMMAND_NAMES:
+        (venv_bin / command).write_text("#!/bin/sh\n", encoding="utf-8")
+    (home / ".personal-jarvis").symlink_to(root, target_is_directory=True)
+    links = home / ".local" / "bin"
+    links.mkdir(parents=True)
+    old = links / "kylo"
+    old.symlink_to(home / ".personal-jarvis" / ".venv" / "bin" / "kylo")
+
+    report = install_commands(
+        root, platform_name="linux", home=home, environ={"PATH": str(links)},
+        which=_never_found,
+    )
+
+    assert "kylo" in report.linked
+    # Windows reports a link target with its long-path prefix; compare the place.
+    assert os.path.samefile(os.readlink(old), venv_bin / "kylo")

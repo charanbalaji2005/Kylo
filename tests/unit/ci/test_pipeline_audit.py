@@ -1,0 +1,1479 @@
+"""Regression checks for CI evidence provenance and staged release publication."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+from scripts.ci import (
+    check_workflow_policy,
+    classify_changes,
+    cut_release,
+    plan_run,
+    ratchet_tests,
+    release_admit,
+    release_assets,
+    required_results,
+    select_tests,
+)
+
+ROOT = Path(__file__).resolve().parents[3]
+REPO = "example/project"
+SHA = "a" * 40
+TAG = "v1.2.3"
+
+
+def run_record(**overrides):
+    result = {
+        "id": 10,
+        "run_attempt": 1,
+        "head_sha": SHA,
+        "head_repository": {"full_name": REPO},
+        "head_branch": TAG,
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/ci.yml",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    return result | overrides
+
+
+class FakeActions:
+    def __init__(self, runs, jobs=None):
+        self.runs = runs
+        self.jobs = (
+            jobs
+            if jobs is not None
+            else [
+                {"name": "CI gate", "conclusion": "success"},
+                {"name": "release qualification", "conclusion": "success"},
+            ]
+        )
+        self.calls = []
+
+    def pages(self, endpoint, key):
+        self.calls.append(endpoint)
+        return self.jobs if key == "jobs" else self.runs
+
+
+@pytest.mark.parametrize(
+    "status,conclusion,expected",
+    [
+        ("completed", "failure", "failure"),
+        ("completed", "cancelled", "failure"),
+        ("in_progress", None, "pending"),
+        ("completed", "success", "success"),
+    ],
+)
+def test_newest_ci_run_overrides_an_older_green(monkeypatch, status, conclusion, expected):
+    fake = FakeActions([run_record(), run_record(id=11, status=status, conclusion=conclusion)])
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA, require_qualification=True) == expected
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"head_sha": "b" * 40},
+        {"head_repository": {"full_name": "fork/project"}},
+        {"head_branch": "feature"},
+        {"event": "pull_request"},
+        {"path": ".github/workflows/pretend-ci.yml"},
+    ],
+)
+def test_named_checks_without_ci_workflow_provenance_do_not_admit(monkeypatch, changed):
+    fake = FakeActions([run_record(**changed)])
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA) == "missing"
+
+
+def test_only_the_latest_attempts_jobs_count(monkeypatch):
+    fake = FakeActions([run_record(run_attempt=3)])
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA, require_qualification=True) == "success"
+    assert "/attempts/3/jobs?" in fake.calls[-1]
+
+
+def test_tag_qualification_uses_the_requested_tag_not_a_later_main_run(monkeypatch):
+    fake = FakeActions([run_record(id=10), run_record(id=11, head_branch="main")])
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA, require_qualification=True, tag=TAG) == "success"
+    assert "/runs/10/attempts/" in fake.calls[-1]
+
+
+def test_other_tag_ci_cannot_qualify_this_release(monkeypatch):
+    fake = FakeActions([run_record(head_branch="v9.9.9")])
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA, require_qualification=True, tag=TAG) == "missing"
+
+
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        [],
+        [{"name": "CI gate", "conclusion": "success"}],
+        [
+            {"name": "CI gate", "conclusion": "success"},
+            {"name": "release qualification", "conclusion": "skipped"},
+        ],
+    ],
+)
+def test_release_requires_qualification_in_same_attempt(monkeypatch, jobs):
+    fake = FakeActions([run_record()], jobs)
+    monkeypatch.setattr(release_admit, "api_pages", fake.pages)
+    assert release_admit.gate_state(REPO, SHA, require_qualification=True) == "failure"
+
+
+def test_api_lookup_failure_cannot_reuse_stale_green(monkeypatch):
+    def unavailable(*args):
+        raise subprocess.CalledProcessError(1, ["gh", "api"])
+
+    monkeypatch.setattr(release_admit, "api_pages", unavailable)
+    assert release_admit.gate_state(REPO, SHA) == "failure"
+
+
+@pytest.mark.parametrize("tag_sha,fetch_fails", [("b" * 40, False), (SHA, True)])
+def test_commit_identity_and_fresh_main_are_required(monkeypatch, tag_sha, fetch_fails):
+    def command(args, **kwargs):
+        if args[1] == "fetch" and fetch_fails:
+            raise subprocess.CalledProcessError(1, args)
+        output = tag_sha if "refs/tags/" in args[-1] else SHA
+        return subprocess.CompletedProcess(args, 0, output + "\n", "")
+
+    monkeypatch.setattr(release_admit, "run_command", command)
+    assert release_admit.check_commit(TAG, SHA)
+
+
+def pipeline_needs():
+    flags = {name: "true" for name in classify_changes.LANES}
+    flags.update(full="true", macos="true", release="true", proven="false", desktop_legs="all")
+    needs = {name: {"result": "success"} for name in required_results.expected_jobs(flags)}
+    needs["detect"]["outputs"] = flags
+    return needs
+
+
+@pytest.mark.parametrize(
+    "job", ["gates", "zizmor", "python-fast", "tests-macos", "frontend", "release-qualification"]
+)
+@pytest.mark.parametrize("missing", [False, True])
+def test_expected_lane_cannot_be_skipped_or_omitted(job, missing):
+    needs = pipeline_needs()
+    assert required_results.evaluate(needs, pipeline=True)["ok"]
+    if missing:
+        del needs[job]
+    else:
+        needs[job]["result"] = "skipped"
+    assert not required_results.evaluate(needs, pipeline=True)["ok"]
+
+
+def test_invalid_detection_does_not_turn_checks_off():
+    needs = pipeline_needs()
+    del needs["detect"]["outputs"]["python"]
+    assert not required_results.evaluate(needs, pipeline=True)["ok"]
+
+
+def test_unaffected_lanes_can_still_skip():
+    flags = {name: "false" for name in classify_changes.LANES}
+    flags.update(full="false", macos="false", release="false", proven="false", desktop_legs="none")
+    needs = {
+        "detect": {"result": "success", "outputs": flags},
+        "gates": {"result": "success"},
+        "zizmor": {"result": "success"},
+        "tests-macos": {"result": "skipped"},
+    }
+    assert required_results.evaluate(needs, pipeline=True)["ok"]
+
+
+def test_a_green_nightly_passes_the_strict_gate():
+    # The nightly of 2026-10-13 had every job green and still failed the
+    # gate: strict mode refused the skipped merge-queue-only macOS job.
+    gate_needs = workflows()["ci.yml"]["jobs"]["gate"]["needs"]
+    assert plan_run.plan("schedule")["mac_impact"] is False
+    flags = {name: "true" for name in classify_changes.LANES}
+    flags.update(
+        full="true",
+        macos="true",
+        release="false",
+        proven="false",
+        desktop_legs="all",
+        mac_tests="false",
+    )
+    never_at_night = {"dependency-review", "soak", "release-qualification", "tests-macos-impact"}
+    needs = {
+        name: {"result": "skipped" if name in never_at_night else "success"} for name in gate_needs
+    }
+    needs["detect"]["outputs"] = flags
+    assert required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+    # Selected, it still has to run, strict or not.
+    flags["mac_tests"] = "true"
+    assert not required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+    # Any other job skipped at night still fails the strict gate.
+    flags["mac_tests"] = "false"
+    needs["tests-linux"]["result"] = "skipped"
+    assert not required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+
+
+def test_dependency_review_runs_only_on_pull_requests_and_may_skip_elsewhere():
+    ci = workflows()["ci.yml"]["jobs"]
+    assert ci["dependency-review"]["if"] == "github.event_name == 'pull_request'"
+    # The workflow audit runs on every event; only a push whose commit the
+    # merge queue already audited skips it.
+    assert ci["zizmor"]["if"] == "needs.detect.outputs.proven != 'true'"
+    needs = pipeline_needs()
+    needs["dependency-review"] = {"result": "skipped"}
+    assert required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+    needs["dependency-review"] = {"result": "failure"}
+    assert not required_results.evaluate(needs, pipeline=True)["ok"]
+
+
+def test_live_site_checks_run_only_nightly_and_never_fail_the_run():
+    job = workflows()["ci.yml"]["jobs"]["live-network"]
+    assert job["if"] == "github.event_name == 'schedule'"
+    live = next(s for s in job["steps"] if s.get("id") == "live")
+    assert live["continue-on-error"] is True
+    assert live["env"]["JARVIS_LIVE_NETWORK_TESTS"] == "1"
+    assert all(s.get("continue-on-error") for s in job["steps"] if "pytest" in s.get("run", ""))
+
+
+def test_every_tier_runs_the_whole_linux_and_windows_suite():
+    ci = workflows()["ci.yml"]["jobs"]
+    for tier in plan_run.TIERS:
+        sized = plan_run.matrices(tier, macos=False)
+        assert sized["linux_shards"] == [1, 2, 3, 4, 5, 6]
+        assert sized["windows_shards"] == [1, 2, 3, 4, 5, 6]
+    # No impact selection in CI: the Windows job always takes its shard of
+    # the whole suite, and the shard count comes from the same plan.
+    windows = "\n".join(step.get("run", "") for step in ci["tests-windows"]["steps"])
+    assert "select_tests" not in windows and "--files-from" not in windows
+    assert ci["tests-windows"]["strategy"]["matrix"]["shard"] == (
+        "${{ fromJSON(needs.detect.outputs.windows_shards) }}"
+    )
+    assert ci["detect"]["outputs"]["windows_shards"] == "${{ steps.mode.outputs.windows_shards }}"
+
+
+def test_merge_queue_runs_the_whole_suite_and_is_never_cancelled():
+    ci = workflows()["ci.yml"]
+    triggers = ci.get("on", ci.get(True))
+    assert triggers["merge_group"] == {"types": ["checks_requested"]}
+    assert "merge_group" in ci["concurrency"]["group"]
+    assert "merge_group" not in ci["concurrency"]["cancel-in-progress"]
+    mode = next(s for s in ci["jobs"]["detect"]["steps"] if s.get("id") == "mode")
+    assert "plan_run.py plan" in mode["run"]
+    assert "merge_group.base_sha" in mode["env"]["PR_BASE"]
+    assert plan_run.decide("merge_group")["tier"] == "queue"
+    assert ci["jobs"]["gate"]["if"] == "${{ !cancelled() }}"
+
+
+# --------------------------------------------------------------------------- tiers
+
+
+def test_a_pull_request_never_takes_a_macos_runner():
+    # Five macOS slots serve every run. With macOS legs on each push, pull
+    # requests waited 6 to 25 minutes for a slot (2026-10-13): the macOS
+    # proof is spent once per change, in the merge queue.
+    sized = plan_run.plan("pull_request")
+    assert sized["tier"] == "pr" and sized["pr_mode"] and not sized["mac_lanes"]
+    assert sized["desktop_legs"] == "none"
+    matrices = [v for k, v in sized.items() if k not in ("macos", "mac_lanes")]
+    assert "macos" not in json.dumps(matrices)
+    # The slowest real-runtime leg never runs per change.
+    assert {"os": "windows-latest", "runtime": "hermes"} not in sized["e2e_matrix"]
+    assert {"os": "windows-latest", "runtime": "openclaw"} in sized["e2e_matrix"]
+    # The real Inno upgrade of a running install stays on the pull request.
+    assert {"os": "windows-latest", "python": "3.12"} in sized["updater_matrix"]
+
+
+def test_a_merge_group_takes_at_most_two_macos_runners():
+    # Five macOS slots serve every group and every rebuild of one. With a
+    # macOS leg per lane plus three test shards a group carried eleven macOS
+    # jobs, and they waited 30 to 54 minutes for a slot (2026-10-13).
+    sized = plan_run.plan("merge_group")
+    assert not sized["mac_lanes"] and not sized["macos"]
+    matrices = [v for k, v in sized.items() if k not in ("macos", "mac_lanes", "mac_impact")]
+    assert "macos" not in json.dumps(matrices)
+    # The two: the macOS tests the change can reach, on one runner, and the
+    # Apple Silicon desktop bundle when the macOS lane is affected.
+    assert sized["mac_impact"] is True and sized["desktop_legs"] == "primary"
+    tests = ["tests/unit/platform/test_a.py", "tests/unit/brain/test_routing.py", "tests/x.py"]
+    assert select_tests.one_runner("all", tests, tests) == (
+        "selected",
+        ["tests/unit/brain/test_routing.py", "tests/unit/platform/test_a.py"],
+    )
+    many = [f"tests/unit/z/test_{i}.py" for i in range(select_tests.SHARD_FILES + 1)]
+    assert select_tests.one_runner("selected", many, many + tests)[1] == [
+        "tests/unit/brain/test_routing.py",
+        "tests/unit/platform/test_a.py",
+    ]
+    # A narrow selection keeps what it reached and takes the focused set too.
+    assert select_tests.one_runner("selected", tests[2:], tests) == ("selected", sorted(tests))
+    assert select_tests.one_runner("none", [], tests) == ("none", [])
+    assert select_tests.shards_for("selected", 2) == [1]
+    # The wide matrix keeps every macOS leg of every lane.
+    wide = plan_run.plan("schedule")
+    assert wide["lane_os"][-1] == "macos-latest" and "macos-latest" in wide["browser_os"]
+    assert {"os": "macos-latest", "python": "3.12"} in wide["updater_matrix"]
+    # The second Windows interpreter of the updater is the queue's one extra.
+    assert {"os": "windows-latest", "python": "3.11"} in sized["updater_matrix"]
+    wide = plan_run.plan("schedule")
+    assert {(leg["os"], leg["runtime"]) for leg in wide["e2e_matrix"]} == {
+        (os, runtime)
+        for os in ("ubuntu-latest", "windows-latest", "macos-latest")
+        for runtime in ("hermes", "openclaw")
+    }
+    # jarvisctl, dragdrop and the installer smoke have no macOS-specific code.
+    assert sized["os_matrix"] == ["ubuntu-latest", "windows-latest"]
+    # A push that reached main without the queue gets the same proof.
+    assert plan_run.plan("push") == sized
+
+
+def test_nightly_release_and_macos_dispatch_keep_the_wide_matrix():
+    for sized in (
+        plan_run.plan("schedule"),
+        plan_run.plan("workflow_dispatch", full_input=True, macos_input=True),
+    ):
+        assert sized["tier"] == "full" and sized["full_mode"] and sized["macos"]
+        assert sized["desktop_legs"] == "all"
+        assert sized["os_matrix"][-1] == "macos-latest"
+        assert len(sized["updater_matrix"]) == 7
+        assert len(sized["crypto_matrix"]) == 6
+        assert set(sized["browser_os"]) == {
+            "ubuntu-latest",
+            "ubuntu-24.04-arm",
+            "windows-latest",
+            "windows-11-arm",
+            "macos-latest",
+            "macos-15-intel",
+        }
+    # A branch asks for macOS before the queue without a full run.
+    branch = plan_run.plan("workflow_dispatch", macos_input=True)
+    assert branch["tier"] == "pr" and branch["pr_mode"] and branch["desktop_legs"] == "all"
+    # The merge train's stand-in for a push on main gets a push's proof,
+    # never the narrower one of a branch run.
+    stand_in = plan_run.plan("workflow_dispatch", ref="refs/heads/main")
+    assert stand_in["tier"] == "queue" and not stand_in["pr_mode"] and stand_in["mac_impact"]
+    assert plan_run.plan("workflow_dispatch", ref="refs/heads/claude/x")["tier"] == "pr"
+    # The merge train's macOS-free full dispatch stays off macOS.
+    train = plan_run.plan("workflow_dispatch", full_input=True)
+    assert train["full_mode"] and not train["mac_lanes"]
+    assert "macos" not in json.dumps(plan_run.matrices("full", macos=False))
+
+
+def test_ci_reads_every_matrix_from_the_plan():
+    ci = workflows()["ci.yml"]["jobs"]
+    outputs = ci["detect"]["outputs"]
+    planned = plan_run.plan("pull_request")
+    for key in ("lane_os", "updater_matrix", "crypto_matrix", "e2e_matrix", "browser_os"):
+        assert key in planned and outputs[key] == f"${{{{ steps.mode.outputs.{key} }}}}"
+    uses = {
+        "realtime-contract": ("os", "lane_os"),
+        "agent-runtimes-unit": ("os", "lane_os"),
+        "jarvisctl": ("os", "os_matrix"),
+        "dragdrop": ("os", "os_matrix"),
+        "updater": ("include", "updater_matrix"),
+        "native-crypto-runtime": ("include", "crypto_matrix"),
+        "agent-runtimes-e2e": ("include", "e2e_matrix"),
+    }
+    for job, (axis, key) in uses.items():
+        assert ci[job]["strategy"]["matrix"][axis] == (
+            f"${{{{ fromJSON(needs.detect.outputs.{key}) }}}}"
+        ), job
+    assert ci["browser"]["with"]["os"] == "${{ needs.detect.outputs.browser_os }}"
+    assert ci["macos-desktop"]["with"]["legs"] == "${{ needs.detect.outputs.desktop_legs }}"
+    assert "desktop_legs != 'none'" in ci["macos-desktop"]["if"]
+
+
+def _queue_run(**changes):
+    run = {
+        "head_sha": "a" * 40,
+        "event": "merge_group",
+        "status": "completed",
+        "conclusion": "success",
+        "path": ".github/workflows/ci.yml",
+        "head_repository": {"full_name": "owner/app"},
+    }
+    run.update(changes)
+    return run
+
+
+def test_a_commit_the_merge_queue_passed_is_proven():
+    assert plan_run.proven_by_queue([_queue_run()], repo="owner/app", sha="a" * 40)
+    # The API may name the workflow with the ref it ran from.
+    suffixed = _queue_run(path=".github/workflows/ci.yml@refs/heads/gh-readonly-queue/main/pr-1")
+    assert plan_run.proven_by_queue([suffixed], repo="owner/app", sha="a" * 40)
+    assert plan_run.is_proven("owner/app", "a" * 40, "token", lambda *_: [_queue_run()])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"head_sha": "b" * 40},
+        {"event": "pull_request"},
+        {"event": "push"},
+        {"conclusion": "failure"},
+        {"status": "in_progress", "conclusion": None},
+        {"path": ".github/workflows/pretend-ci.yml"},
+        {"head_repository": {"full_name": "fork/app"}},
+        {"head_repository": None},
+    ],
+)
+def test_anything_but_a_green_queue_run_of_this_commit_is_not_proven(changes):
+    runs = [_queue_run(**changes)]
+    assert not plan_run.proven_by_queue(runs, repo="owner/app", sha="a" * 40)
+
+
+def test_the_proven_lookup_fails_open():
+    def broken(*_):
+        raise OSError("api down")
+
+    assert not plan_run.is_proven("owner/app", "a" * 40, "token", broken)
+    assert not plan_run.is_proven("owner/app", "a" * 40, "", lambda *_: [_queue_run()])
+    assert not plan_run.is_proven("owner/app", "a" * 40, "token", lambda *_: [])
+
+
+def test_a_proven_push_runs_nothing_but_detection_and_the_gate():
+    ci = workflows()["ci.yml"]["jobs"]
+    lanes = classify_changes.classify(["kylo/core/config.py"], proven=True)
+    assert not any(lanes.values())
+    proven = next(s for s in ci["detect"]["steps"] if s.get("id") == "proven")
+    # Only a run on main that is neither a full nor a macOS run may skip.
+    assert '"$GITHUB_REF" = "refs/heads/main"' in proven["run"]
+    assert '"$FULL" != "true"' in proven["run"] and '"$MACOS" != "true"' in proven["run"]
+    assert ci["detect"]["permissions"] == {"contents": "read", "actions": "read"}
+    assert ci["gates"]["if"] == "needs.detect.outputs.proven != 'true'"
+    flags = {name: "false" for name in classify_changes.LANES}
+    flags.update(full="false", macos="false", release="false", proven="true", desktop_legs="none")
+    needs = {name: {"result": "skipped"} for name in ci["gate"]["needs"]}
+    needs["detect"] = {"result": "success", "outputs": flags}
+    assert required_results.evaluate(needs, pipeline=True)["ok"]
+    # A nightly run is never satisfied by an earlier proof.
+    assert not required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+    # Without the proof the same skips fail the gate.
+    flags["proven"] = "false"
+    assert not required_results.evaluate(needs, pipeline=True)["ok"]
+
+
+def test_the_linux_shard_count_has_one_source():
+    ci = workflows()["ci.yml"]["jobs"]
+    shard = next(s for s in ci["tests-linux"]["steps"] if s.get("name") == "Run shard")
+    floor = next(s for s in ci["test-report"]["steps"] if "--expected-shards" in s.get("run", ""))
+    for step in (shard, floor):
+        assert step["env"]["SHARDS"] == "${{ needs.detect.outputs.linux_shards }}"
+    assert '--shard "$SHARD/$total"' in shard["run"]
+    assert '--expected-shards "$total"' in floor["run"]
+
+
+def test_a_red_nightly_reaches_someone_and_only_a_nightly_on_main_can_write_issues():
+    alert = workflows()["nightly-alert.yml"]
+    assert alert["permissions"] == {}
+    job = alert["jobs"]["alert"]
+    assert job["permissions"] == {"actions": "read", "issues": "write"}
+    condition = " ".join(job["if"].split())
+    for clause in (
+        "github.event.workflow_run.event == 'schedule'",
+        "github.event.workflow_run.head_repository.full_name == github.repository",
+        "github.event.workflow_run.head_branch == 'main'",
+        (
+            'contains(fromJSON(\'["success","failure","cancelled","timed_out"]\'), '
+            "github.event.workflow_run.conclusion)"
+        ),
+    ):
+        assert clause in condition, clause
+    # No pull-request code runs next to the issue token.
+    assert all("uses" not in step for step in job["steps"])
+    script = job["steps"][0]["run"]
+    assert "label=nightly-ci" in script and "write issue close" in script
+    assert "(success|failure|cancelled|timed_out) ;;" in script
+    assert '[ "$label" = "nightly-ci" ] && [ "$conclusion" = "cancelled" ]' in script
+    assert 'select(.name == "CI gate") | .conclusion' in script
+    assert '[ "$gate_conclusion" != "failure" ]' in script
+    assert '[ "$label" = "macos-main" ] && [ "$conclusion" = "cancelled" ]' in script
+    assert '.jobs[] | select(.conclusion == "failure") | .name' in script
+    assert "macOS sweep ended cancelled without a failed job" in script
+    assert '--label "$label"' in script
+    # A check by hand runs from main only, vets the run it is given like the
+    # event, and writes nothing unless the dry run is switched off.
+    by_hand = "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"
+    assert by_hand in job["if"]
+    assert '.event == "schedule"' in script and '.head_branch == "main"' in script
+    triggers = alert.get("on", alert.get(True))
+    assert triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"] is True
+    for direct in ("gh issue close", "gh issue edit", "gh issue create", "gh label create"):
+        assert direct not in script, direct
+    # The legs that left the per-change tiers are exactly what the nightly keeps.
+    nightly, queue = plan_run.plan("schedule"), plan_run.plan("merge_group")
+    only_nightly = [leg for leg in nightly["e2e_matrix"] if leg not in queue["e2e_matrix"]]
+    assert {"os": "windows-latest", "runtime": "hermes"} in only_nightly and len(only_nightly) == 3
+
+
+def test_the_nightly_run_never_queues_its_macos_legs_ahead_of_a_merge_group():
+    ci = workflows()["ci.yml"]
+    # One leg at a time in every matrix that carries macOS legs: the nightly
+    # run has no reader waiting, the merge groups sharing the five slots do.
+    assert plan_run.plan("schedule")["matrix_parallel"] == 1
+    for event in ("pull_request", "merge_group", "push"):
+        assert plan_run.plan(event)["matrix_parallel"] == plan_run.UNTHROTTLED
+    # A release tag run is a manual dispatch and stays at full width.
+    release = plan_run.plan("workflow_dispatch", full_input=True, macos_input=True)
+    assert release["matrix_parallel"] == plan_run.UNTHROTTLED
+    throttle = "${{ fromJSON(needs.detect.outputs.matrix_parallel) }}"
+    for job in (
+        "tests-macos",
+        "jarvisctl",
+        "native-crypto-runtime",
+        "realtime-contract",
+        "updater",
+        "dragdrop",
+        "agent-runtimes-unit",
+        "agent-runtimes-e2e",
+    ):
+        assert ci["jobs"][job]["strategy"]["max-parallel"] == throttle, job
+    assert ci["jobs"]["detect"]["outputs"]["matrix_parallel"] == (
+        "${{ steps.mode.outputs.matrix_parallel }}"
+    )
+    # Every matrix fits below the unthrottled limit.
+    widest = max(len(v) for v in plan_run.plan("schedule").values() if isinstance(v, list))
+    assert widest < plan_run.UNTHROTTLED
+
+
+def test_a_merge_group_runs_the_macos_tests_its_change_can_reach():
+    ci = workflows()["ci.yml"]["jobs"]
+    # Only the queue tier: a pull request takes no macOS runner, and the wide
+    # matrix runs the whole macOS suite instead.
+    assert plan_run.plan("merge_group")["mac_impact"] is True
+    assert plan_run.plan("push")["mac_impact"] is True
+    assert plan_run.plan("pull_request")["mac_impact"] is False
+    assert plan_run.plan("schedule")["mac_impact"] is False
+    # One runner for an ordinary change, two for a large one, the full split
+    # when the change selects everything, none when it reaches no test.
+    assert select_tests.shards_for("selected", 12) == [1]
+    assert select_tests.shards_for("selected", select_tests.SHARD_FILES + 1) == [1, 2]
+    assert select_tests.shards_for("all", 2500) == [1, 2, 3]
+    assert select_tests.shards_for("none", 0) == []
+    job = ci["tests-macos-impact"]
+    assert job["runs-on"] == "macos-latest"
+    assert job["if"] == (
+        "needs.detect.outputs.python == 'true' && needs.detect.outputs.mac_tests == 'true'"
+    )
+    assert job["strategy"]["matrix"]["shard"] == (
+        "${{ fromJSON(needs.detect.outputs.mac_test_shards) }}"
+    )
+    run = next(s for s in job["steps"] if s.get("name") == "Run the selected tests")["run"]
+    assert "--files-from mac_tests.txt" in run and '--shard "$SHARD/$total"' in run
+    ratchet = next(s for s in job["steps"] if s.get("name", "").startswith("Ratchet"))["run"]
+    assert "test-baseline-macos.json" in ratchet
+    # The selection is made once, in detect, and shipped in the snapshot; an
+    # empty matrix can never reach the job.
+    detect = ci["detect"]
+    select = next(s for s in detect["steps"] if s.get("id") == "mactests")["run"]
+    assert "select_tests.py --one-runner --changed-from changed.txt --out mac_tests.txt" in select
+    # The selection is sized by the duration history, so it runs after the
+    # step that guarantees one exists.
+    assert "--durations test_durations.json" in select
+    names = [s.get("name") or s.get("id") for s in detect["steps"]]
+    assert names.index("Ensure a duration snapshot exists") < names.index(
+        "Select the macOS tests this change can reach"
+    )
+    assert "'[1]'" in detect["outputs"]["mac_test_shards"]
+    shared = next(
+        s for s in detect["steps"] if s.get("name") == "Share duration snapshot with every shard"
+    )
+    assert "mac_tests.txt" in shared["with"]["path"].split()
+    # The gate waits for it and requires it when it was selected.
+    assert "tests-macos-impact" in ci["gate"]["needs"]
+    flags = {name: "true" for name in classify_changes.LANES}
+    flags.update(full="false", macos="false", release="false", proven="false")
+    flags.update(desktop_legs="primary", mac_tests="true")
+    assert "tests-macos-impact" in required_results.expected_jobs(flags)
+    needs = {name: {"result": "success"} for name in required_results.expected_jobs(flags)}
+    needs["detect"]["outputs"] = flags
+    assert required_results.evaluate(needs, pipeline=True)["ok"]
+    needs["tests-macos-impact"]["result"] = "skipped"
+    assert not required_results.evaluate(needs, pipeline=True)["ok"]
+    flags["mac_tests"] = "false"
+    assert "tests-macos-impact" not in required_results.expected_jobs(flags)
+
+
+def test_the_macos_runner_of_a_merge_group_is_filled_up_to_its_budget():
+    # The runner ended after one to three minutes while the gate waited eight
+    # to nine for Windows: the rest goes to the tests a macOS-only failure is
+    # most likely to show in, by the duration history.
+    reached = "tests/unit/brain/test_reached.py"
+    focus = "tests/unit/platform/test_focus.py"
+    lane = ["tests/unit/dictation/test_cheap.py", "tests/unit/dictation/test_dear.py"]
+    aware = "tests/unit/core/test_paths.py"
+    plain = "tests/unit/core/test_plain.py"
+    tests = sorted([reached, focus, *lane, aware, plain])
+    texts = dict.fromkeys(tests, "import json")
+    texts[aware] = 'if sys.platform == "darwin":'
+    history = {reached: 500.0, focus: 10.0, lane[0]: 5.0, lane[1]: 40.0, aware: 20.0, plain: 1.0}
+    assert select_tests.mac_lane_tests(tests) == sorted([*lane, focus])
+    assert select_tests.mac_aware(tests, texts) == [aware]
+
+    def sized(budget, mode="selected", chosen=(reached,)):
+        return select_tests.one_runner(mode, list(chosen), tests, texts, history, budget)[1]
+
+    # Enough budget: everything macOS-relevant, never an unrelated test.
+    assert sized(1000.0) == sorted([reached, focus, *lane, aware])
+    # What the change reached always runs, even alone above the budget.
+    assert sized(100.0) == [reached]
+    # The focused set first, then the lane's directories, then the tests
+    # that name macOS; a file that no longer fits ends its tier only.
+    assert sized(515.0) == sorted([reached, focus, lane[0]])
+    assert sized(536.0) == sorted([reached, focus, lane[0], aware])
+    # A change that reaches everything runs the whole focused set, then fills.
+    assert sized(0.0, mode="all", chosen=tests) == [focus]
+    assert sized(16.0, mode="all", chosen=tests) == sorted([focus, lane[0]])
+    # A file the history never timed costs the runner's default, not nothing.
+    assert select_tests.one_runner("selected", [reached], tests, texts, {}, 4.0)[1] == [reached]
+    # Whatever the selection holds, it is one runner.
+    assert select_tests.MAC_BUDGET_SECONDS <= 720
+
+
+def test_main_gets_the_whole_suite_on_macos_after_the_merge():
+    sweep = workflows()["macos-main-sweep.yml"]
+    triggers = sweep.get("on", sweep.get(True))
+    assert triggers["push"]["branches"] == ["main"]
+    # One sweep at a time and never cancelled: the pending one covers every
+    # commit merged while the running one took its single macOS slot.
+    assert sweep["concurrency"] == {"group": "macos-main-sweep", "cancel-in-progress": False}
+    assert sweep["permissions"] == {"contents": "read"}
+    assert list(sweep["jobs"]) == ["suite"]
+    job = sweep["jobs"]["suite"]
+    assert job["runs-on"] == "macos-latest" and "strategy" not in job
+    assert job["if"] == "github.ref == 'refs/heads/main'"
+    runs = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "run_tests_parallel.py tests" in runs and "--shard" not in runs
+    assert "--files-from" not in runs and "test-baseline-macos.json" in runs
+    # Nothing waits for it: it is no job of the workflow behind `CI gate`.
+    assert "macos-main-sweep" not in yaml.safe_dump(workflows()["ci.yml"])
+    # A red sweep reaches someone through the same job as a red nightly.
+    alert = workflows()["nightly-alert.yml"]
+    watched = alert.get("on", alert.get(True))["workflow_run"]
+    assert watched["workflows"] == ["CI", sweep["name"]] and watched["branches"] == ["main"]
+    job = alert["jobs"]["alert"]
+    assert f"github.event.workflow_run.name == '{sweep['name']}'" in job["if"]
+    script = job["steps"][0]["run"]
+    assert '$path == ".github/workflows/macos-main-sweep.yml"' in script
+    assert "label=macos-main" in script and "/compare/" in script
+
+
+def test_only_a_complete_green_run_on_main_writes_the_duration_caches():
+    ci = workflows()["ci.yml"]["jobs"]
+    job = ci["duration-cache"]
+    # Any run on main (nightly, manual, a push that bypassed the queue), and
+    # only after every Linux and Windows shard succeeded: no `!cancelled()`.
+    assert job["if"] == "needs.detect.outputs.python == 'true' && github.ref == 'refs/heads/main'"
+    assert set(job["needs"]) == {"detect", "tests-linux", "tests-windows"}
+    saves = {
+        s["with"]["path"]: s["with"]["key"]
+        for s in job["steps"]
+        if "cache/save@" in s.get("uses", "")
+    }
+    assert saves == {
+        "test_durations.json": "test-durations-${{ github.run_id }}",
+        "test_durations_windows.json": "test-durations-windows-${{ github.run_id }}",
+    }
+    assert not any("cache/save@" in s.get("uses", "") for s in ci["test-report"]["steps"])
+    assert "duration-cache" in ci["gate"]["needs"]
+    # Each history is merged onto the one the run started from: a file that
+    # was flaky in this run reports no timing and must keep the one it had.
+    names = [s.get("name", "") for s in job["steps"]]
+    assert names.index("Download the duration history this run started from") < names.index(
+        "Merge the shard timings"
+    )
+    merge = next(s["run"] for s in job["steps"] if s.get("name") == "Merge the shard timings")
+    assert "--base test_durations.json --out test_durations.json reports/linux" in merge
+    assert (
+        "--base test_durations_windows.json --out test_durations_windows.json reports/windows"
+        in merge
+    )
+
+
+def test_windows_shards_by_its_own_history_and_falls_back_to_the_linux_one():
+    ci = workflows()["ci.yml"]["jobs"]
+    detect = ci["detect"]["steps"]
+    restores = {
+        s["with"]["path"]: s["with"]["restore-keys"]
+        for s in detect
+        if s.get("uses", "").startswith("actions/cache/restore@")
+    }
+    # Two caches with two keys: the Linux history keeps its key and version.
+    assert restores == {
+        "test_durations.json": "test-durations-",
+        "test_durations_windows.json": "test-durations-windows-",
+    }
+    ensure = next(s for s in detect if s.get("id") == "snapshot")["run"]
+    assert "test -s test_durations_windows.json || cp test_durations.json" in ensure
+    shared = next(s for s in detect if s.get("name") == "Share duration snapshot with every shard")
+    assert shared["with"]["path"].split()[:2] == [
+        "test_durations.json",
+        "test_durations_windows.json",
+    ]
+    windows = next(s for s in ci["tests-windows"]["steps"] if s.get("name") == "Run shard")["run"]
+    assert "--durations test_durations_windows.json" in windows
+    assert '--durations-out "out/durations-windows-$SHARD.json"' in windows
+    linux = next(s for s in ci["tests-linux"]["steps"] if s.get("name") == "Run shard")["run"]
+    assert "test_durations_windows" not in linux
+
+
+@pytest.mark.parametrize("payload", [{}, {"failed_ids": [], "counts": {}, "files": 0}])
+def test_empty_test_evidence_fails_even_without_a_baseline(tmp_path, payload):
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    assert (
+        ratchet_tests.main(["check", "--baseline", str(tmp_path / "missing.json"), str(report)])
+        == 1
+    )
+
+
+def test_missing_baseline_accepts_a_real_green_report(tmp_path):
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps({"failed_ids": [], "counts": {"passed": 2, "tests": 2}, "files": 1})
+    )
+    assert (
+        ratchet_tests.main(["check", "--baseline", str(tmp_path / "missing.json"), str(report)])
+        == 0
+    )
+
+
+def partition():
+    files = ["tests/a.py", "tests/b.py"]
+    digest = hashlib.sha256("\n".join(files).encode()).hexdigest()
+    return [
+        {"shard": f"{i + 1}/2", "file_paths": [file], "suite_files": 2, "suite_digest": digest}
+        for i, file in enumerate(files)
+    ]
+
+
+def test_shard_evidence_proves_complete_partition():
+    reports = partition()
+    assert ratchet_tests.partition_errors(reports, 2) == []
+    assert ratchet_tests.partition_errors(reports[:1], 2)
+    reports[1]["file_paths"] = reports[0]["file_paths"]
+    assert ratchet_tests.partition_errors(reports, 2)
+    reports[1]["file_paths"] = []
+    assert ratchet_tests.partition_errors(reports, 2)
+
+
+def asset_fixture():
+    digest = "b" * 64
+    assets = [
+        {"name": name, "size": 1, "state": "uploaded", "digest": f"sha256:{digest}"}
+        for name in release_assets.REQUIRED_ASSETS
+    ]
+    manifests = {
+        "installers-SHA256SUMS.txt": "".join(
+            f"{digest}  {n}\n" for n in sorted(release_assets.INSTALLERS)
+        ),
+        "checksums.txt": "".join(
+            f"{digest}  {n}\n" for n in sorted(release_assets.SIGNED - {"payload-commit.txt"})
+        ),
+    }
+    return assets, manifests
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing", "empty", "digest", "duplicate", "traversal", "manifest"]
+)
+def test_release_assets_must_be_complete_and_match_manifest(defect):
+    assets, manifests = asset_fixture()
+    assert release_assets.asset_errors(assets, manifests) == []
+    installer = next(a for a in assets if a["name"] in release_assets.INSTALLERS)
+    if defect == "missing":
+        assets.remove(installer)
+    elif defect == "empty":
+        installer["size"] = 0
+    elif defect == "digest":
+        installer["digest"] = "sha256:" + "c" * 64
+    elif defect == "duplicate":
+        assets.append(installer)
+    elif defect == "traversal":
+        manifests["checksums.txt"] += "b" * 64 + "  ../outside\n"
+    else:
+        manifests["checksums.txt"] = ""
+    assert release_assets.asset_errors(assets, manifests)
+
+
+def test_in_progress_duplicate_publisher_blocks_finalization():
+    workflow = "desktop-installers.yml"
+    path = f".github/workflows/{workflow}"
+    runs = [run_record(path=path, status="in_progress"), run_record(path=path, id=11)]
+    assert release_assets.publisher_state(runs, REPO, TAG, SHA, workflow) == "pending"
+    runs[0].update(status="completed", conclusion="failure")
+    assert release_assets.publisher_state(runs, REPO, TAG, SHA, workflow) == "success"
+
+
+@pytest.mark.parametrize(
+    "workflow,job_name",
+    [
+        ("release.yml", "Publish to PyPI"),
+        ("desktop-installers.yml", "Checksums and GitHub Release"),
+        ("sign-installer.yml", "release"),
+    ],
+)
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "failure", None])
+def test_green_publisher_workflow_requires_the_actual_publish_job(
+    monkeypatch,
+    workflow,
+    job_name,
+    conclusion,
+):
+    calls = []
+
+    def pages(endpoint, key):
+        calls.append(endpoint)
+        if key == "jobs":
+            return [{"name": job_name, "status": "completed", "conclusion": conclusion}]
+        return [run_record(path=f".github/workflows/{workflow}", run_attempt=2)]
+
+    monkeypatch.setattr(release_assets, "api_pages", pages)
+    expected = "success" if conclusion == "success" else "failure"
+    assert release_assets.publisher_evidence(REPO, TAG, SHA, workflow) == expected
+    assert "/attempts/2/jobs?" in calls[-1]
+
+
+def test_missing_publish_job_fails_closed(monkeypatch):
+    def pages(endpoint, key):
+        return [] if key == "jobs" else [run_record(path=".github/workflows/release.yml")]
+
+    monkeypatch.setattr(release_assets, "api_pages", pages)
+    assert release_assets.publisher_evidence(REPO, TAG, SHA, "release.yml") == "failure"
+
+
+def test_resuming_release_does_not_repeat_successful_or_running_publishers(monkeypatch):
+    commands = []
+
+    def pages(endpoint, key):
+        if key == "jobs":
+            return [{"name": "Publish to PyPI", "status": "completed", "conclusion": "success"}]
+        workflow = endpoint.split("/workflows/")[1].split("/")[0]
+        status = "in_progress" if workflow == "desktop-installers.yml" else "completed"
+        conclusion = "failure" if workflow == "sign-installer.yml" else "success"
+        return [
+            run_record(path=f".github/workflows/{workflow}", status=status, conclusion=conclusion)
+        ]
+
+    monkeypatch.setattr(release_assets, "api_pages", pages)
+    monkeypatch.setattr(release_assets, "run_command", lambda args: commands.append(args))
+    release_assets.dispatch_missing_publishers(REPO, TAG, SHA)
+    assert commands == [
+        ["gh", "workflow", "run", "sign-installer.yml", "--repo", REPO, "--ref", TAG]
+    ]
+
+
+def test_published_release_cannot_be_reopened_or_overwritten(monkeypatch):
+    monkeypatch.setattr(
+        release_assets, "release_info", lambda *a: {"tagName": TAG, "isDraft": False}
+    )
+    with pytest.raises(ValueError, match="already published"):
+        release_assets.prepare(REPO, TAG)
+
+
+@pytest.mark.parametrize("conclusion", [None, "failure"])
+def test_incomplete_publishers_never_write_a_release(monkeypatch, conclusion):
+    def pages(endpoint, key):
+        workflow = endpoint.split("/workflows/")[1].split("/")[0]
+        return [
+            run_record(
+                path=f".github/workflows/{workflow}",
+                conclusion=conclusion,
+                status="completed" if conclusion else "in_progress",
+            )
+        ]
+
+    monkeypatch.setattr(release_assets, "api_pages", pages)
+    if conclusion:
+        with pytest.raises(ValueError, match="publisher failed"):
+            release_assets.finalize(REPO, TAG, SHA, 0)
+    else:
+        assert release_assets.finalize(REPO, TAG, SHA, 0) == 0
+
+
+def workflows():
+    return {
+        p.name: yaml.safe_load(p.read_text(encoding="utf-8"))
+        for p in (ROOT / ".github/workflows").glob("*.yml")
+    }
+
+
+def test_workflow_security_policy_and_mutation_regressions():
+    clean = workflows()
+    assert check_workflow_policy.audit(clean) == []
+    for mutate in (
+        lambda w: w["release.yml"]["jobs"]["publish"].pop("if"),
+        lambda w: w["ci.yml"]["jobs"]["gate"]["needs"].remove("frontend"),
+        lambda w: w["sign-installer.yml"]["permissions"].update({"id-token": "write"}),
+        lambda w: w["sign-installer.yml"]["jobs"]["release"]["needs"].remove("provenance"),
+        lambda w: w["stargazer-map.yml"]["jobs"]["verify"]["steps"][0].update(
+            {"uses": "actions/checkout@v4"}
+        ),
+        lambda w: w["release-cut.yml"]["jobs"]["cut"].pop("environment"),
+        lambda w: w["release-cut.yml"]["jobs"]["tag"].pop("environment"),
+        lambda w: w["release-cut.yml"]["jobs"]["bundle"].update({"environment": "release-cut"}),
+        lambda w: w["release-cut.yml"]["jobs"]["bundle"]["permissions"].update(
+            {"contents": "write"}
+        ),
+        lambda w: w["release-cut.yml"]["jobs"]["bundle"]["steps"][0].update(
+            {"env": {"KEY": "${{ secrets.MERGE_APP_PRIVATE_KEY }}"}}
+        ),
+        lambda w: _release_cut_step(w, "Tag the admitted release")["env"].update(
+            {"GH_TOKEN": "${{ github.token }}"}
+        ),
+        lambda w: w["ci.yml"]["jobs"]["gate"]["steps"][0].update(
+            {"env": {"KEY": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}"}}
+        ),
+    ):
+        changed = copy.deepcopy(clean)
+        mutate(changed)
+        assert check_workflow_policy.audit(changed)
+
+
+def _release_cut_step(definitions: dict, name: str) -> dict:
+    jobs = definitions["release-cut.yml"]["jobs"]
+    steps = [step for job in jobs.values() for step in job.get("steps", [])]
+    return next(step for step in steps if step.get("name") == name)
+
+
+def test_release_cut_writes_with_fresh_bot_tokens_and_reads_with_github_token():
+    definitions = workflows()
+    jobs = definitions["release-cut.yml"]["jobs"]
+    for job in (jobs["cut"], jobs["tag"]):
+        assert job["environment"] == "release-cut"
+        assert job["env"]["GH_TOKEN"] == "${{ github.token }}"  # noqa: S105 - expression
+        assert job["env"]["TOKEN_IS_BOT"] == "${{ vars.RELEASE_APP_ID == '' }}"  # noqa: S105
+        checkout = job["steps"][0]
+        assert checkout["uses"].startswith("actions/checkout@")
+        assert checkout["with"]["persist-credentials"] is False
+    # Every write step mints its own token right before it (one-hour lifetime).
+    for job, writer, minter in (
+        ("cut", "Open the candidate PR", "candidate-token"),
+        ("cut", "Land the candidate", "land-token"),
+        ("tag", "Tag the admitted release", "tag-token"),
+    ):
+        steps = jobs[job]["steps"]
+        names = [step.get("name") for step in steps]
+        assert steps[names.index(writer) - 1].get("id") == minter
+        token = _release_cut_step(definitions, writer)["env"]["GH_TOKEN"]
+        assert token == f"${{{{ steps.{minter}.outputs.token || github.token }}}}"
+    minters = [
+        s
+        for job in (jobs["cut"], jobs["tag"])
+        for s in job["steps"]
+        if s.get("id", "").endswith("-token")
+    ]
+    assert len(minters) == 3
+    for step in minters:
+        assert step["uses"].startswith("actions/create-github-app-token@")
+        assert "vars.RELEASE_APP_ID != ''" in step["if"]
+        assert step["with"]["private-key"] == "${{ secrets.RELEASE_APP_PRIVATE_KEY }}"
+        assert "permission-workflows" not in step["with"]
+    # Long CI waits never hold a bot token.
+    for reader in ("Wait for the candidate CI gate", "Admit the release commit"):
+        assert "GH_TOKEN" not in _release_cut_step(definitions, reader).get("env", {})
+
+
+def test_all_shards_consume_the_same_detect_output_including_partial_reruns():
+    ci = workflows()["ci.yml"]["jobs"]
+    for name in ("tests-linux", "tests-windows", "tests-macos"):
+        restores = [
+            s for s in ci[name]["steps"] if s.get("uses", "").startswith("actions/cache/restore@")
+        ]
+        assert not restores
+        snapshot = next(
+            s for s in ci[name]["steps"] if s.get("name") == "Download the shared duration snapshot"
+        )
+        assert snapshot["with"]["name"] == "${{ needs.detect.outputs.duration_snapshot }}"
+
+
+def test_release_ci_targets_tag_with_all_platforms():
+    step = _release_cut_step(workflows(), "Dispatch the publishing workflows on the tag")
+    dispatch = step["run"]
+    assert 'ci.yml --ref "v$V" -f full=true -f include_macos=true' in dispatch
+
+
+def test_release_tag_ci_is_excluded_from_branch_cancellation():
+    concurrency = workflows()["ci.yml"]["concurrency"]
+    assert "github.ref_type == 'branch'" in concurrency["cancel-in-progress"]
+    assert "github.ref_type == 'branch'" in concurrency["group"]
+
+
+def test_release_cut_lands_through_protection_and_tags_the_merge_commit():
+    jobs = workflows()["release-cut.yml"]["jobs"]
+    commands = "\n".join(
+        step.get("run", "") for job in jobs.values() for step in job.get("steps", [])
+    )
+    assert "git push origin HEAD:main" not in commands
+    merge = 'gh pr merge "$CANDIDATE" --merge --match-head-commit "$CANDIDATE_SHA"'
+    assert merge in commands
+    assert 'git checkout --detach "$merged"' in commands
+    assert '[ "$TOKEN_IS_BOT" = "true" ] || [ "$TAG_PUSHED" != "true" ]' in commands
+
+
+def test_release_cut_updates_only_the_root_lock_version(tmp_path):
+    (tmp_path / "kylo").mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "personal-jarvis"\nversion = "1.0.0"\n'
+    )
+    (tmp_path / "kylo/__init__.py").write_text('__version__ = "1.0.0"\n')
+    (tmp_path / "CHANGELOG.md").write_text("# Changes\n\n## [Unreleased]\n\n- Added\n")
+    (tmp_path / "uv.lock").write_text(
+        '[[package]]\nname = "personal-jarvis"\nversion = "1.0.0"\n'
+        'source = { editable = "." }\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n'
+    )
+    cut_release.apply("1.0.1", "Notes", "2026-10-02", tmp_path)
+    lock = (tmp_path / "uv.lock").read_text()
+    assert 'name = "personal-jarvis"\nversion = "1.0.1"' in lock
+    assert 'name = "other"\nversion = "1.0.0"' in lock
+
+
+class FakeRelease:
+    """Exercise the full coordinator with in-memory GitHub state and local files."""
+
+    def __init__(self, *, corrupt_source=False, wrong_payload=False):
+        self.assets, self.manifests = asset_fixture()
+        self.manifests["payload-commit.txt"] = ("c" * 40 if wrong_payload else SHA) + "\n"
+        self.corrupt_source = corrupt_source
+        self.commands = []
+        # The signed update manifest every new desktop release carries (#810),
+        # signed with a throwaway key that install() pins in its place.
+        import base64
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        from kylo.core.update_manifest import build_manifest
+
+        key = Ed25519PrivateKey.generate()
+        self.public_key = base64.b64encode(
+            key.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        ).decode("ascii")
+        manifest = build_manifest(
+            version=TAG,
+            tag=TAG,
+            checksums=self.manifests["installers-SHA256SUMS.txt"].encode("utf-8"),
+        )
+        self.manifests["installers-update-manifest.json"] = manifest.decode("ascii")
+        self.manifests["installers-update-manifest.json.sig"] = base64.b64encode(
+            key.sign(manifest)
+        ).decode("ascii")
+        for name in release_assets.UPDATE_MANIFEST_ASSETS:
+            self.assets.append({"name": name, "size": 1, "state": "uploaded"})
+
+    def pages(self, endpoint, key):
+        if "/assets?" in endpoint:
+            return self.assets
+        if key == "jobs":
+            return [
+                {"name": name, "status": "completed", "conclusion": "success"}
+                for name in release_assets.PUBLISHER_JOBS.values()
+            ]
+        workflow = endpoint.split("/workflows/")[1].split("/")[0]
+        return [run_record(path=f".github/workflows/{workflow}")]
+
+    def command(self, args, **kwargs):
+        self.commands.append(args)
+        output = ""
+        if args[:3] == ["gh", "release", "download"]:
+            name = args[args.index("--pattern") + 1]
+            folder = Path(args[args.index("--dir") + 1])
+            (folder / name).write_text(self.manifests[name], encoding="utf-8")
+        elif args[:2] == ["git", "archive"]:
+            assert args[-1] == f"refs/tags/{TAG}"
+            Path(args[args.index("-o") + 1]).write_bytes(b"source archive fixture")
+        elif args[:2] == ["git", "show"]:
+            output = "## [1.2.3]\n\nRelease notes.\n"
+        elif args[:3] == ["gh", "release", "upload"]:
+            for file in map(Path, args[6 : args.index("--clobber")]):
+                digest = hashlib.sha256(file.read_bytes()).hexdigest()
+                self.assets.append({"name": file.name, "digest": f"sha256:{digest}"})
+            if self.corrupt_source:
+                self.assets[-1]["digest"] = "sha256:" + "0" * 64
+        elif args[:3] == ["gh", "release", "edit"]:
+            assert "--draft=false" in args
+            assert Path(args[args.index("--notes-file") + 1]).read_text() == "Release notes."
+        else:
+            raise AssertionError(f"unexpected external command: {args}")
+        return subprocess.CompletedProcess(args, 0, output, "")
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr("kylo.core.update_manifest.PINNED_PUBLIC_KEYS", (self.public_key,))
+        monkeypatch.setattr(release_assets, "api_pages", self.pages)
+        monkeypatch.setattr(release_assets, "run_command", self.command)
+        monkeypatch.setattr(release_assets, "gate_state", lambda *a, **k: "success")
+        monkeypatch.setattr(
+            release_assets,
+            "release_info",
+            lambda *a: {
+                "databaseId": 123,
+                "tagName": TAG,
+                "isDraft": True,
+                "isPrerelease": False,
+            },
+        )
+
+
+def test_finalization_uploads_and_verifies_source_before_publication(monkeypatch):
+    fake = FakeRelease()
+    fake.install(monkeypatch)
+    assert release_assets.finalize(REPO, TAG, SHA, 0) == 0
+    assert fake.commands[-1][:3] == ["gh", "release", "edit"]
+    assert sum(command[:3] == ["gh", "release", "upload"] for command in fake.commands) == 1
+    # The source archive under its current name and the one older installers know.
+    prefixes = [c[3] for c in fake.commands if c[:2] == ["git", "archive"]]
+    assert prefixes == ["--prefix=kylo/", "--prefix=personal-jarvis/"]
+    assert {asset["name"] for asset in fake.assets} >= {
+        "kylo-src.tar.gz",
+        "personal-jarvis-src.tar.gz",
+        "source-SHA256SUMS.txt",
+    }
+
+
+@pytest.mark.parametrize("defect", ["corrupt_source", "wrong_payload"])
+def test_corrupt_release_never_becomes_public(monkeypatch, defect):
+    fake = FakeRelease(**{defect: True})
+    fake.install(monkeypatch)
+    with pytest.raises(ValueError, match="digest mismatch|payload commit"):
+        release_assets.finalize(REPO, TAG, SHA, 0)
+    assert not any(command[:3] == ["gh", "release", "edit"] for command in fake.commands)
+
+
+@pytest.mark.parametrize("defect", ["unsigned", "forged"])
+def test_a_release_without_a_valid_signed_update_manifest_stays_a_draft(monkeypatch, defect):
+    fake = FakeRelease()
+    fake.install(monkeypatch)
+    if defect == "unsigned":
+        fake.assets = [
+            asset
+            for asset in fake.assets
+            if asset["name"] not in release_assets.UPDATE_MANIFEST_ASSETS
+        ]
+    else:
+        fake.manifests["installers-update-manifest.json.sig"] = "A" * 86 + "=="
+    with pytest.raises(ValueError, match="installers-update-manifest.json"):
+        release_assets.finalize(REPO, TAG, SHA, 0)
+    assert not any(command[:3] == ["gh", "release", "edit"] for command in fake.commands)
+
+
+def test_skipped_pypi_publication_cannot_finalize_a_release(monkeypatch):
+    fake = FakeRelease()
+    fake.install(monkeypatch)
+
+    def pages(endpoint, key):
+        result = fake.pages(endpoint, key)
+        if key == "jobs":
+            for job in result:
+                if job["name"] == "Publish to PyPI":
+                    job["conclusion"] = "skipped"
+        return result
+
+    monkeypatch.setattr(release_assets, "api_pages", pages)
+    with pytest.raises(ValueError, match="publisher failed"):
+        release_assets.finalize(REPO, TAG, SHA, 0)
+    assert fake.commands == []
+
+
+def test_publisher_evidence_job_names_match_the_actual_workflows():
+    definitions = workflows()
+    for workflow, expected_name in release_assets.PUBLISHER_JOBS.items():
+        job_id = "publish" if workflow == "release.yml" else "release"
+        assert definitions[workflow]["jobs"][job_id].get("name", job_id) == expected_name
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "0.9.0", "01.1.0"])
+def test_release_cut_refuses_repeated_or_lower_versions_before_writing(monkeypatch, version):
+    monkeypatch.setattr(cut_release, "versions", lambda: ("1.0.0", "1.0.0"))
+    with pytest.raises(SystemExit, match="greater|leading zeroes"):
+        cut_release.main(["--version", version])
+
+
+def test_normal_full_run_does_not_require_release_only_evidence():
+    needs = pipeline_needs()
+    needs["detect"]["outputs"]["release"] = "false"
+    needs["release-qualification"]["result"] = "skipped"
+    assert required_results.evaluate(needs, pipeline=True, strict=True)["ok"]
+
+
+def test_signpath_signing_is_dormant_gated_and_verified_before_shipping():
+    windows = workflows()["desktop-installers.yml"]["jobs"]["windows"]
+    gate = windows["env"]["HAS_SIGNPATH_SIGNING"]
+    for needed in (
+        "github.ref_type == 'tag'",
+        "secrets.SIGNPATH_API_TOKEN",
+        "vars.SIGNPATH_ORGANIZATION_ID",
+        "vars.SIGNPATH_PROJECT_SLUG",
+        "vars.SIGNPATH_SIGNING_POLICY_SLUG",
+    ):
+        assert needed in gate
+    assert "SIGNPATH_API_TOKEN" not in str(windows["env"]).replace(
+        "secrets.SIGNPATH_API_TOKEN != ''", ""
+    )
+    steps = windows["steps"]
+    names = [s.get("name", "") for s in steps]
+    stage = steps[names.index("Stage the unsigned installer for SignPath")]
+    sign = steps[names.index("Sign the installer (SignPath Foundation)")]
+    verify = next(s for s in steps if "Get-AuthenticodeSignature" in s.get("run", ""))
+    upload = steps[names.index("Upload the installer")]
+    for step in (stage, sign, verify):
+        assert step["if"] == "env.HAS_SIGNPATH_SIGNING == 'true'"
+    # The unsigned file must never match the release job's download pattern.
+    assert not stage["with"]["name"].startswith("installer-")
+    artifact_id = "${{ steps.signpath-unsigned.outputs.artifact-id }}"
+    assert sign["with"]["github-artifact-id"] == artifact_id
+    order = [steps.index(s) for s in (stage, sign, verify, upload)]
+    assert order == sorted(order)
+    assert "SignPath Foundation" in verify["run"] and "'Valid'" in verify["run"]
+    azure = steps[names.index("Sign the installer (Azure Trusted Signing)")]
+    assert "env.HAS_SIGNPATH_SIGNING != 'true'" in azure["if"]
+    assert windows["permissions"] == {"contents": "read", "actions": "read"}
+
+
+def test_native_signing_keys_are_imported_only_on_admitted_tags_and_always_removed():
+    desktop = workflows()["desktop-installers.yml"]["jobs"]
+    mac = desktop["macos"]
+    assert "github.ref_type == 'tag'" in mac["env"]["HAS_APPLE_SIGNING"]
+    imports = [s for s in mac["steps"] if "security import" in s.get("run", "")]
+    assert len(imports) == 1 and imports[0]["if"] == "env.HAS_APPLE_SIGNING == 'true'"
+    cleanup = next(s for s in mac["steps"] if "security delete-keychain" in s.get("run", ""))
+    assert "always()" in cleanup["if"]
+    build = next(s for s in mac["steps"] if s.get("name") == "Build the DMG")
+    assert "APPLE_CERTIFICATE_PASSWORD" not in build["env"]
+    assert "AZURE_CLIENT_SECRET" not in desktop["windows"]["env"]
+    signing = workflows()["sign-installer.yml"]["jobs"]["sign"]
+    assert any(
+        s.get("if") == "always()"
+        and "offline-ceremony.key" in s.get("run", "")
+        and "pq-mldsa65.key" in s["run"]
+        for s in signing["steps"]
+    )
+
+
+class FakeAssetServer:
+    def __init__(self, *, draft=True, race=None):
+        self.draft = draft
+        self.race = race
+        self.assets = {}
+        self.commands = []
+
+    @staticmethod
+    def metadata(path):
+        raw = path.read_bytes()
+        return {
+            "name": path.name,
+            "size": len(raw),
+            "state": "uploaded",
+            "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        }
+
+    def command(self, args):
+        self.commands.append(args)
+        assert args[:3] == ["gh", "release", "upload"]
+        assert "--clobber" not in args
+        path = Path(args[-1])
+        if self.race:
+            # A competing upload/finalizer completed between listing and POST.
+            self.draft = False
+            self.assets[path.name] = self.metadata(path)
+            if self.race == "different":
+                self.assets[path.name]["digest"] = "sha256:" + "0" * 64
+            raise subprocess.CalledProcessError(1, args)
+        assert path.name not in self.assets
+        self.assets[path.name] = self.metadata(path)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(release_assets, "run_command", self.command)
+        monkeypatch.setattr(release_assets, "api_pages", lambda *a: list(self.assets.values()))
+        monkeypatch.setattr(
+            release_assets,
+            "release_info",
+            lambda *a: {
+                "databaseId": 123,
+                "tagName": TAG,
+                "isDraft": self.draft,
+            },
+        )
+
+
+def test_draft_upload_is_idempotent_and_never_changes_release_visibility(monkeypatch, tmp_path):
+    server = FakeAssetServer()
+    server.install(monkeypatch)
+    files = {name: tmp_path / name for name in ("installer.exe", "checksums.txt")}
+    for path in files.values():
+        path.write_bytes(b"verified build bytes")
+    release_assets.upload_draft_files(REPO, TAG, files)
+    release_assets.upload_draft_files(REPO, TAG, files)
+    assert len(server.commands) == 2
+    assert server.draft
+
+
+@pytest.mark.parametrize("defect", ["different", "incomplete"])
+def test_conflicting_draft_assets_block_all_uploads_before_the_first_write(
+    monkeypatch,
+    tmp_path,
+    defect,
+):
+    server = FakeAssetServer()
+    server.install(monkeypatch)
+    existing, fresh = tmp_path / "z-existing.exe", tmp_path / "a-fresh.exe"
+    existing.write_bytes(b"existing")
+    fresh.write_bytes(b"fresh")
+    server.assets[existing.name] = server.metadata(existing)
+    if defect == "different":
+        server.assets[existing.name]["digest"] = "sha256:" + "0" * 64
+    else:
+        server.assets[existing.name]["state"] = "uploading"
+    with pytest.raises(ValueError, match="refusing to replace"):
+        release_assets.upload_draft_files(REPO, TAG, {p.name: p for p in (fresh, existing)})
+    assert server.commands == []
+
+
+@pytest.mark.parametrize("race", ["identical", "different"])
+def test_competing_upload_and_publication_never_reopens_or_replaces_assets(
+    monkeypatch,
+    tmp_path,
+    race,
+):
+    server = FakeAssetServer(race=race)
+    server.install(monkeypatch)
+    path = tmp_path / "installer.exe"
+    path.write_bytes(b"fixture installer")
+    if race == "different":
+        with pytest.raises(subprocess.CalledProcessError):
+            release_assets.upload_draft_files(REPO, TAG, {path.name: path})
+    else:
+        release_assets.upload_draft_files(REPO, TAG, {path.name: path})
+    assert not server.draft
+    assert len(server.commands) == 1
+    assert all(command[:3] == ["gh", "release", "upload"] for command in server.commands)
+
+
+def test_asset_uploader_rejects_public_release_before_any_write(monkeypatch, tmp_path):
+    server = FakeAssetServer(draft=False)
+    server.install(monkeypatch)
+    path = tmp_path / "installer.exe"
+    path.write_bytes(b"bytes")
+    with pytest.raises(ValueError, match="unpublished draft"):
+        release_assets.upload_draft_files(REPO, TAG, {path.name: path})
+    assert server.commands == []
+
+
+@pytest.mark.parametrize("profile", ["desktop", "signing"])
+def test_staging_requires_the_complete_profile_and_rejects_duplicate_names(tmp_path, profile):
+    required = (
+        release_assets.DESKTOP_ASSETS if profile == "desktop" else release_assets.SIGNING_ASSETS
+    )
+    for name in required:
+        (tmp_path / name).write_bytes(b"asset fixture")
+    (tmp_path / "unexpected-private-file.key").write_bytes(b"not an artifact")
+    assert set(release_assets.staged_assets(tmp_path, profile)) == required
+    duplicate = tmp_path / "nested"
+    duplicate.mkdir()
+    (duplicate / next(iter(required))).write_bytes(b"duplicate")
+    with pytest.raises(ValueError, match="duplicate staged"):
+        release_assets.staged_assets(tmp_path, profile)
+
+
+def test_empty_staging_directory_cannot_upload_a_partial_release(tmp_path):
+    with pytest.raises(ValueError, match="missing staged"):
+        release_assets.staged_assets(tmp_path, "signing")
+
+
+def test_upload_cli_uses_the_complete_desktop_profile_without_git_mutation(monkeypatch, tmp_path):
+    server = FakeAssetServer()
+    server.install(monkeypatch)
+    for name in release_assets.DESKTOP_ASSETS:
+        (tmp_path / name).write_bytes(b"staged artifact")
+    assert (
+        release_assets.main(
+            [
+                "upload",
+                "--repo",
+                REPO,
+                "--tag",
+                TAG,
+                "--directory",
+                str(tmp_path),
+                "--profile",
+                "desktop",
+            ]
+        )
+        == 0
+    )
+    assert set(server.assets) == release_assets.DESKTOP_ASSETS
+
+
+def test_workflow_policy_rejects_provenance_reopening_releases():
+    definitions = workflows()
+    definitions["sign-installer.yml"]["jobs"]["provenance"]["with"]["upload-assets"] = True
+    assert check_workflow_policy.audit(definitions)
+
+
+def test_producers_cannot_edit_visibility_or_replace_assets():
+    definitions = workflows()
+    for filename in ("desktop-installers.yml", "sign-installer.yml"):
+        steps = definitions[filename]["jobs"]["release"]["steps"]
+        assert not any(s.get("uses", "").startswith("softprops/") for s in steps)
+        upload = next(s for s in steps if "release_assets.py upload" in s.get("run", ""))
+        assert "--clobber" not in upload["run"]
+    assert definitions["sign-installer.yml"]["jobs"]["provenance"]["with"]["upload-assets"] is False
+
+
+def _git_history(tmp_path, *, extra_path: str | None = None):
+    """main with one commit, plus a bundle commit on top that only touches dist."""
+    import shutil
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required")
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    dist = tmp_path / "kylo" / "ui" / "web" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    if extra_path:
+        (tmp_path / extra_path).write_text("smuggled\n", encoding="utf-8")
+    git("checkout", "-q", "--detach")
+    git("add", "-A")
+    git("commit", "-q", "-m", "bundle")
+    return base, git("rev-parse", "HEAD")
+
+
+def _run_in(tmp_path):
+    def command(args, *, check=True):
+        return subprocess.run(args, cwd=tmp_path, capture_output=True, text=True, check=check)
+
+    return command
+
+
+def test_bundle_commit_on_main_is_admitted(monkeypatch, tmp_path):
+    base, bundle = _git_history(tmp_path)
+    monkeypatch.setattr(release_admit, "run_command", _run_in(tmp_path))
+    assert release_admit.on_main_or_bundle(base, "main")
+    assert release_admit.on_main_or_bundle(bundle, "main")
+
+
+def test_bundle_commit_that_touches_code_is_refused(monkeypatch, tmp_path):
+    _base, bundle = _git_history(tmp_path, extra_path="app.py")
+    monkeypatch.setattr(release_admit, "run_command", _run_in(tmp_path))
+    assert not release_admit.on_main_or_bundle(bundle, "main")

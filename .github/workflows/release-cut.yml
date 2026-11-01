@@ -1,0 +1,499 @@
+# Cut a release — maintainer-only, manual. A release never happens by itself.
+#
+# Actions tab -> "Release cut" -> Run workflow (or `gh workflow run release-cut.yml
+# -f bump=patch`). It:
+#
+#   1. refuses unless the latest `CI gate` on main is green,
+#   2. bumps pyproject.toml + kylo/__init__.py and writes the CHANGELOG
+#      section (scripts/ci/cut_release.py: [Unreleased] notes, or the
+#      Conventional Commits since the last tag),
+#   3. checks the version commit through a candidate PR, then lands it through
+#      main's merge queue and waits for the landed commit,
+#   4. builds the frontend bundle from that commit (a job without secrets),
+#      commits it on top as the tag's only extra commit, so the tag carries a
+#      bundle built from its own sources while main need not track one, and
+#      pushes the annotated tag; the three publishing workflows (PyPI, desktop
+#      installers, signed installer) run on it. Each of them starts with
+#      release-gate.yml, which waits for CI on the release commit.
+#   5. publishes the GitHub Release with the notes and the resumable
+#      kylo-src.tar.gz and personal-jarvis-src.tar.gz assets the install
+#      scripts fall back to (current name first). The
+#      in-app updater follows releases/latest, so this is the step that reaches
+#      users.
+#   6. runs release-smoke.yml against the published release (read-only).
+#
+# Release bot. The `cut` and `tag` jobs run in the `release-cut` environment, which only
+# main may deploy to. That environment holds the private key of the release
+# bot GitHub App (secret RELEASE_APP_PRIVATE_KEY, variable RELEASE_APP_ID). The
+# job mints short-lived installation tokens from it to push the candidate
+# branch, open and merge the candidate PR, and push the tag. The "release tags"
+# ruleset lets only that app and repository admins create `v*` tags, and the
+# `release-signing` and `pypi` environments admit only `v*` tags, so the
+# signing keys and PyPI are reachable only from a tag the bot cut on main.
+#
+# A bot token, unlike GITHUB_TOKEN, fires the normal events: the candidate PR
+# runs CI by itself and the new tag starts the publishers by itself. Without
+# the bot (RELEASE_APP_ID unset) the job falls back to GITHUB_TOKEN and
+# dispatches the publishers itself, because a GITHUB_TOKEN tag push fires no
+# `push: tags` event; workflow_dispatch is the documented exception.
+
+name: Release cut
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "SemVer part to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "Exact version instead of a bump (optional, X.Y.Z)"
+        required: false
+        default: ""
+      resume_sha:
+        description: "Already merged and CI-qualified commit that introduced the version, to finish (optional full SHA)"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    name: cut release
+    if: github.ref == 'refs/heads/main'
+    # Holds the release bot key; its deployment policy admits main only.
+    environment: release-cut
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      checks: read
+    outputs:
+      version: ${{ steps.bump.outputs.version || steps.resume.outputs.version }}
+      sha: ${{ steps.admit.outputs.sha }}
+    env:
+      # Reads and dispatches use GITHUB_TOKEN. Each write step overrides
+      # GH_TOKEN with a bot token minted right before it: an installation
+      # token expires after one hour, and the CI waits between writes can take
+      # longer than that.
+      GH_TOKEN: ${{ github.token }}
+      # true = no release bot: pushes and merges made with GITHUB_TOKEN start
+      # no workflows, so this job dispatches the publishers itself.
+      TOKEN_IS_BOT: ${{ vars.RELEASE_APP_ID == '' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          # git pushes through gh (next step), which uses the step's GH_TOKEN.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Let git push with the step's token
+        run: gh auth setup-git --hostname github.com
+      - name: main must be green
+        if: inputs.resume_sha == ''
+        run: python scripts/ci/release_admit.py --ci-only --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --wait-minutes 0
+      - name: Select an already merged version commit
+        id: resume
+        if: inputs.resume_sha != ''
+        env:
+          RESUME_SHA: ${{ inputs.resume_sha }}
+        run: |
+          [[ "$RESUME_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Resume requires a full commit SHA."; exit 1; }
+          expected="$(python -c 'from scripts.ci.release_admit import versions; print(versions()[0])')"
+          # Validate ancestry before executing anything from the selected ref.
+          git merge-base --is-ancestor "$RESUME_SHA" HEAD
+          git checkout --detach "$RESUME_SHA"
+          actual="$(python -c 'from scripts.ci.release_admit import versions; print(versions()[0])')"
+          [ "$actual" = "$expected" ] || { echo "::error::Resume cannot select an older version."; exit 1; }
+          # Only the commit that introduced the version may be tagged. A later
+          # commit with the same version would ship changes that no CHANGELOG
+          # section lists, and the next cut starts after the tag (#529).
+          before="$(git show "$RESUME_SHA^:pyproject.toml" \
+            | python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
+          if [ "$before" = "$actual" ]; then
+            echo "::error::$RESUME_SHA does not introduce v$actual; resume the version commit instead:"
+            git log --format='%H %s' -S"## [$actual]" "$RESUME_SHA" -- CHANGELOG.md
+            exit 1
+          fi
+          echo "version=$actual" >> "$GITHUB_OUTPUT"
+      - name: Bump version + CHANGELOG
+        id: bump
+        if: inputs.resume_sha == ''
+        env:
+          BUMP: ${{ inputs.bump }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then arg=(--version "$VERSION"); else arg=(--bump "$BUMP"); fi
+          new="$(python scripts/ci/cut_release.py "${arg[@]}" --notes-out "$RUNNER_TEMP/notes.md" | tail -1)"
+          # A second cut dispatched before the first one landed starts from the
+          # old main and computes the same version again. Stop before it opens
+          # a candidate PR and lands an empty duplicate version commit.
+          git fetch --quiet --tags origin
+          if git show-ref --verify --quiet "refs/tags/v$new"; then
+            echo "::error::v$new is already tagged. main moved after this run was dispatched; start a new cut from current main."
+            exit 1
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          git diff --stat
+      - name: Mint a release bot token for the candidate
+        id: candidate-token
+        if: inputs.resume_sha == '' && vars.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open the candidate PR
+        id: candidate
+        if: inputs.resume_sha == ''
+        env:
+          V: ${{ steps.bump.outputs.version }}
+          GH_TOKEN: ${{ steps.candidate-token.outputs.token || github.token }}
+        run: |
+          git config user.name "jarvis-release[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml kylo/__init__.py uv.lock CHANGELOG.md
+          git commit -m "chore(release): publish v$V"
+          sha="$(git rev-parse HEAD)"
+          candidate="release-cut/v${V}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git push origin "HEAD:refs/heads/$candidate"
+          # Only eligible events (here pull_request) satisfy branch protection.
+          # A workflow_dispatch CI success is not accepted by GitHub for landing.
+          # GITHUB_TOKEN may not open pull requests here; the release bot may.
+          if ! gh pr create --base main --head "$candidate" --title "chore(release): publish v$V" \
+            --body-file "$RUNNER_TEMP/notes.md"; then
+            echo "::notice::Repository policy may require a maintainer to open the candidate PR."
+            echo "Open https://github.com/$GITHUB_REPOSITORY/compare/main...$candidate?expand=1" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$candidate" >> "$GITHUB_OUTPUT"
+      - name: Wait for the candidate CI gate
+        if: inputs.resume_sha == ''
+        env:
+          CANDIDATE: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          ci_run=""
+          for attempt in {1..60}; do
+            ci_run="$(gh run list --workflow ci.yml --branch "$CANDIDATE" --commit "$CANDIDATE_SHA" \
+              --event pull_request --json databaseId --jq '.[0].databaseId // empty')"
+            [ -n "$ci_run" ] && break
+            sleep 5
+          done
+          [ -n "$ci_run" ] || { echo "::error::Candidate CI did not start."; exit 1; }
+          if [ "$(gh run view "$ci_run" --json conclusion --jq '.conclusion')" = "action_required" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$ci_run/approve"
+          fi
+          gh run watch "$ci_run" --exit-status --interval 30
+          state="$(gh api "repos/$GITHUB_REPOSITORY/commits/$CANDIDATE_SHA/check-runs?check_name=CI%20gate" \
+            --jq '(.check_runs | max_by(.id)) | if .status == "completed" then .conclusion else (.status // "missing") end')"
+          [ "$state" = "success" ] || { echo "::error::Candidate CI gate is $state."; exit 1; }
+      - name: Mint a release bot token for landing
+        id: land-token
+        if: inputs.resume_sha == '' && vars.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Land the candidate
+        if: inputs.resume_sha == ''
+        env:
+          CANDIDATE: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+          GH_TOKEN: ${{ steps.land-token.outputs.token || github.token }}
+          DISPATCH_TOKEN: ${{ github.token }}
+        run: |
+          # main requires a merge queue: this adds the candidate to it (the
+          # queue squash-merges after its own CI run), or merges directly
+          # when the queue is off. Either way, wait for the landed commit.
+          # `gh pr merge` cannot queue here: with a queue it falls back to
+          # auto-merge, which this repository disables. Enqueue explicitly.
+          pr_id="$(gh pr view "$CANDIDATE" --json id --jq .id)"
+          enqueue='mutation($id: ID!, $sha: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $sha}) { mergeQueueEntry { state } } }'
+          if ! gh api graphql -f query="$enqueue" -f id="$pr_id" -f sha="$CANDIDATE_SHA"; then
+            echo "Merge queue unavailable; merging the candidate directly."
+            gh pr merge "$CANDIDATE" --merge --match-head-commit "$CANDIDATE_SHA"
+          fi
+          merged=""
+          for attempt in {1..150}; do
+            merged="$(gh pr view "$CANDIDATE" --json mergeCommit --jq '.mergeCommit.oid // empty')"
+            [ -n "$merged" ] && break
+            sleep 30
+          done
+          [[ "$merged" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Missing merge commit."; exit 1; }
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git checkout --detach "$merged"
+          # Always dispatch: a GITHUB_TOKEN merge starts no CI, and a bot
+          # merge's push run shares the main-push group, where a newer push to
+          # main drops it while it still waits for a runner.
+          GH_TOKEN="$DISPATCH_TOKEN" gh workflow run ci.yml --ref main -f full=true -f include_macos=true
+      - name: Admit the release commit
+        id: admit
+        env:
+          V: ${{ steps.bump.outputs.version || steps.resume.outputs.version }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$sha" origin/main
+          actual="$(python -c 'from scripts.ci.release_admit import versions; print(versions()[0])')"
+          [ "$actual" = "$V" ] || { echo "::error::Merged package version changed."; exit 1; }
+          python scripts/ci/release_admit.py --ci-only --sha "$sha" --repo "$GITHUB_REPOSITORY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # The frontend bundle the release ships, built from the admitted commit.
+  # No secrets and a read-only token: npm runs here and nowhere near the
+  # release bot key. The tag job below commits the result on top of the
+  # release commit, so the tag (what the updater, the installers and PyPI
+  # read) always carries a bundle built from its own sources, while main does
+  # not have to track one.
+  bundle:
+    name: build the release frontend bundle
+    needs: cut
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Move to the admitted commit, which must be on main
+        env:
+          SHA: ${{ needs.cut.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Not a commit SHA."; exit 1; }
+          # Only reviewed code that landed on main gets built here.
+          git fetch --quiet --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$SHA" origin/main
+          git checkout --quiet --detach "$SHA"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          # No dependency cache: a release build must not read or seed a
+          # cache other runs share (CodeQL actions/cache-poisoning).
+          package-manager-cache: false
+      - name: Build
+        working-directory: kylo/ui/web/frontend
+        # `npm run build` empties dist/ first, so it holds exactly this build.
+        run: |
+          npm ci
+          npm run build
+      - name: Startup bundle budget
+        run: python3 scripts/ci/check_frontend_bundle_budget.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-frontend-bundle
+          path: kylo/ui/web/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  tag:
+    name: tag release
+    needs: [cut, bundle]
+    # Holds the release bot key; its deployment policy admits main only.
+    environment: release-cut
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      # The public v* tag exists from here on (pushed now or by an earlier run).
+      tagged: ${{ steps.tag.outcome == 'success' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TOKEN_IS_BOT: ${{ vars.RELEASE_APP_ID == '' }}
+      V: ${{ needs.cut.outputs.version }}
+      SHA: ${{ needs.cut.outputs.sha }}
+      DIST: kylo/ui/web/dist
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.cut.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Let git push with the step's token
+        run: gh auth setup-git --hostname github.com
+      - name: Put the release bundle in place
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$SHA" ] || { echo "::error::Checkout is not the admitted commit."; exit 1; }
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-frontend-bundle
+          path: kylo/ui/web/dist
+      - name: Mint a release bot token for the tag
+        id: tag-token
+        if: vars.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Tag the admitted release
+        id: tag
+        env:
+          # The "release tags" ruleset lets only the release bot and admins
+          # create v* tags.
+          GH_TOKEN: ${{ steps.tag-token.outputs.token || github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "jarvis-release[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/tags/v$V"; then
+            # A resumed cut: the tag names the admitted commit itself (older
+            # releases) or its one bundle commit.
+            tagged="$(git rev-parse "v$V^{}")"
+            if [ "$tagged" != "$SHA" ] && [ "$(git rev-parse "$tagged^")" != "$SHA" ]; then
+              echo "::error::The tag already names another commit."
+              exit 1
+            fi
+            echo 'pushed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # -f: main may ignore dist/; the tag still has to carry it.
+          git add -f -A -- "$DIST"
+          outside=""
+          while IFS= read -r path; do
+            case "$path" in
+              "" | "$DIST"/*) ;;
+              *) outside="$outside$path"$'\n' ;;
+            esac
+          done < <(git diff --cached --name-only)
+          if [ -n "$outside" ]; then
+            echo "::error::The bundle touched files outside $DIST:"
+            echo "$outside"
+            exit 1
+          fi
+          if ! git diff --cached --quiet; then
+            python3 scripts/ci/check_dist_consistency.py --staged --prune
+            python3 scripts/ci/check_dist_consistency.py --staged
+            git diff --cached --shortstat
+            git commit -q -m "chore(release): frontend bundle for v$V"
+          fi
+          git tag -a "v$V" -m "v$V"
+          git push origin "v$V"
+          echo 'pushed=true' >> "$GITHUB_OUTPUT"
+      - name: Dispatch the publishing workflows on the tag
+        env:
+          TAG_PUSHED: ${{ steps.tag.outputs.pushed }}
+        run: |
+          # ci.yml has no tag trigger; dispatch full CI on the immutable tag.
+          gh workflow run ci.yml --ref "v$V" -f full=true -f include_macos=true
+          python scripts/ci/release_assets.py prepare --repo "$GITHUB_REPOSITORY" --tag "v$V"
+          # A new tag pushed by the release bot already started the publishers.
+          # Dispatching twice races an immutable PyPI upload against itself.
+          if [ "$TOKEN_IS_BOT" = "true" ] || [ "$TAG_PUSHED" != "true" ]; then
+            python scripts/ci/release_assets.py dispatch --repo "$GITHUB_REPOSITORY" --tag "v$V"
+          fi
+
+  publish:
+    name: publish GitHub Release
+    needs: [cut, tag]
+    concurrency:
+      group: release-finalize-v${{ needs.cut.outputs.version }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ needs.cut.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          ref: v${{ needs.cut.outputs.version }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      # The Release is what the in-app updater follows, so it waits for the
+      # same admission the publishing workflows wait for.
+      - name: Wait for CI on the release commit
+        run: python scripts/ci/release_admit.py --tag "v$V" --sha "$(git rev-parse HEAD)" --repo "$GITHUB_REPOSITORY"
+      - name: Wait for publishers and finalize the complete release
+        run: >-
+          python scripts/ci/release_assets.py finalize
+          --repo "$GITHUB_REPOSITORY" --tag "v$V"
+          --sha "$(git rev-parse HEAD)" --wait-minutes 150
+
+  # The tag is immutable, but everything after it can still fail: a flaky tag
+  # CI run, a publisher (for example a new advisory in the publish-time
+  # dependency audit) or finalization. The version then stays an unpublished
+  # draft that no updater sees, and nothing retries it (v3.1.0, v4.0.0 and
+  # v4.1.0 stayed drafts this way, unnoticed). Say so in one issue per version,
+  # with the recovery steps.
+  stranded:
+    name: report a stranded tag
+    needs: [cut, tag, publish]
+    if: always() && needs.tag.outputs.tagged == 'true' && needs.publish.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the stranded release issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.cut.outputs.version }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Release v$V is tagged but not published"
+          body="Release cut $RUN_URL pushed the immutable tag \`v$V\`, but publishing ended with \`$PUBLISH_RESULT\`. The GitHub Release stays a draft, so the in-app updater and the installers do not see v$V.
+
+          To recover (docs/ci-pipeline.md):
+          1. Find the red run: tag CI (\`gh run list --workflow ci.yml --branch v$V\`) and the publishers Release to PyPI, Desktop installers and Sign installer (\`gh run list --branch v$V\`).
+          2. A flaky failure: \`gh run rerun <run id> --failed\`, tag CI first, then each failed publisher. A rerun reuses the original build artifacts.
+          3. Finalize: rerun the failed \`publish GitHub Release\` job of the Release cut run, or \`gh workflow run release-finalize.yml --ref main -f tag=v$V\`.
+          4. If a publisher cannot pass for this commit (a real test failure, or a new advisory in the dependency audit), fix main and cut the next patch release instead. v$V then stays a draft.
+
+          Close this issue once v$V is published or superseded."
+          # Search narrows the list; the exact title decides (v4.1.0 vs v4.1.1).
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          echo "::error::v$V is tagged but not published; recovery steps are in the issue \"$title\"."
+
+  # Read-only proof that what users now download installs: assets, checksums,
+  # build provenance and the signed wrapper on Linux, Windows and macOS. Called
+  # from here because a release published with GITHUB_TOKEN fires no `release`
+  # event. A red smoke means the release is already public: follow the
+  # rollback runbook in docs/ci-pipeline.md.
+  smoke:
+    name: smoke published release
+    needs: [cut, publish]
+    permissions:
+      contents: read
+      attestations: read
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      tag: v${{ needs.cut.outputs.version }}
+      require_attestation: true
