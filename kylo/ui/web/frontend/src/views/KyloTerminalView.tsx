@@ -20,7 +20,6 @@ import {
   ChevronDown,
   Columns2,
   Eraser,
-  FolderOpen,
   History,
   Play,
   Plus,

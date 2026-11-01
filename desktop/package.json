@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test build/test/",
+    "test": "npm run build && node --test build/test/validate.test.js",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder --win nsis --x64 --publish never",
     "dist:dir": "npm run build && electron-builder --win dir --x64 --publish never"
