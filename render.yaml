@@ -1,49 +1,28 @@
-# Render Blueprint Specification for Kylo
+# Render Blueprint Specification for Kylo Frontend Website
 # Reference: https://render.com/docs/blueprint-spec
 #
-# Kylo: Headless server image with FastAPI + WebSocket backend and built-in React UI.
-#
-# Deployment on Render:
-# 1. Connect this repo to Render Blueprints (https://dashboard.render.com/blueprints).
-# 2. Render detects this render.yaml and provisions the web service.
-# 3. Enter your AI provider key(s) (Anthropic, OpenAI, Gemini, or OpenRouter) in the Render Dashboard.
+# Free Static Site Deployment for the Kylo Frontend Website.
 
 services:
   - type: web
-    name: kylo
-    runtime: docker
-    plan: starter # Persistent SSD disk requires Starter or higher. Set plan: free if running ephemeral without disk.
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    healthCheckPath: /api/health
-    disk:
-      name: kylo-data
-      mountPath: /app/data
-      sizeGB: 10
+    name: kylo-frontend
+    runtime: static
+    buildCommand: cd kylo/ui/web/frontend && npm ci && npm run build
+    staticPublishPath: ./kylo/ui/web/dist
     envVars:
-      - key: JARVIS_BIND_HOST
-        value: 0.0.0.0
-      - key: JARVIS_NONINTERACTIVE
-        value: "1"
-      - key: JARVIS_CONFIG
-        value: /app/data/jarvis.toml
-      - key: JARVIS_DATA_DIR
-        value: /app/data
-      - key: HOME
-        value: /app/data/home
-      - key: PORT
-        value: "8000"
-      - key: JARVIS_CONTROL_API_KEY
-        generateValue: true
-      # AI Model Provider Keys (Set via Render Dashboard)
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-
+      - key: NODE_VERSION
+        value: "20"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=4096"
+    routes:
+      # Single Page Application (SPA) routing: fallback all routes to index.html
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
