@@ -104,6 +104,22 @@ export default defineConfig({
     // prebuilt dist shipped to the public repo. The Vite dev server keeps its
     // own inline maps, so local debugging is unaffected.
     sourcemap: false,
+    chunkSizeWarningLimit: 2500,
+    rollupOptions: {
+      maxParallelFileOps: 10,
+      cache: false,
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules")) {
+            if (id.includes("monaco-editor")) return "vendor-monaco";
+            if (id.includes("onnxruntime-web")) return "vendor-onnx";
+            if (id.includes("@huggingface")) return "vendor-hf";
+            if (id.includes("three") || id.includes("@react-three")) return "vendor-three";
+            if (id.includes("lucide-react")) return "vendor-icons";
+          }
+        },
+      },
+    },
   },
   test: {
     environment: "jsdom",
