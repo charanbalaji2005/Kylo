@@ -9,6 +9,10 @@ versioning per [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [4.1.3] — 2026-11-02
+
 ### Changed
 
 - The small-machine vision download is `qwen3-vl:2b-instruct` (1.9 GB, refreshed
