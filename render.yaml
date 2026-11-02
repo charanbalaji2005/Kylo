@@ -1,11 +1,31 @@
-# Render Blueprint Specification for Kylo Frontend Website
+# Render Blueprint Specification for Kylo Website & Web Frontend
 # Reference: https://render.com/docs/blueprint-spec
-#
-# Free Static Site Deployment for the Kylo Frontend Website.
 
 services:
+  # 1. Kylo Product Details & Marketing Landing Website (Next.js Static Export)
   - type: web
-    name: kylo-frontend
+    name: kylo-website
+    runtime: static
+    buildCommand: cd website && npm install && npm run build
+    staticPublishPath: ./website/out
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /_next/static/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=0, must-revalidate
+
+  # 2. Kylo Web App Frontend (Vite Single Page Application)
+  - type: web
+    name: kylo-app
     runtime: static
     buildCommand: cd kylo/ui/web/frontend && npm ci && npm run build
     staticPublishPath: ./kylo/ui/web/dist
@@ -15,7 +35,6 @@ services:
       - key: NODE_OPTIONS
         value: "--max-old-space-size=4096"
     routes:
-      # Single Page Application (SPA) routing: fallback all routes to index.html
       - type: rewrite
         source: /*
         destination: /index.html

@@ -1,0 +1,139 @@
+@import "tailwindcss";
+
+/*
+ * Kylo site tokens. Monochrome only: every surface, rim and ink is a neutral
+ * grey. Status colours are deliberately absent; state is shown with weight,
+ * opacity and shape instead of hue.
+ */
+@theme {
+  --color-canvas: #000000;
+  --color-surface: #090909;
+  --color-panel: #0e0e0f;
+  --color-raised: #141415;
+  --color-elevated: #1b1b1d;
+  --color-ink: #ffffff;
+  --color-ink-soft: #e4e4e7;
+  --color-body: #a1a1aa;
+  --color-muted: #71717a;
+  --color-faint: #52525b;
+  --color-hairline: #27272a;
+  --color-hairline-soft: #18181b;
+  --color-hairline-strong: #3f3f46;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --text-display: clamp(2.75rem, 1.4rem + 5.4vw, 6rem);
+  --text-display--line-height: 1;
+  --text-display--letter-spacing: -0.045em;
+  --text-headline: clamp(2rem, 1.3rem + 2.6vw, 3.5rem);
+  --text-headline--line-height: 1.05;
+  --text-headline--letter-spacing: -0.035em;
+  --text-eyebrow: 0.6875rem;
+  --text-eyebrow--line-height: 1;
+  --text-eyebrow--letter-spacing: 0.14em;
+
+  --animate-blink: blink 1.1s step-end infinite;
+  --animate-pulse-soft: pulse-soft 2.4s ease-in-out infinite;
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+  @keyframes pulse-soft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01", "ss03";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow-x: clip;
+  }
+
+  ::selection {
+    background: var(--color-ink);
+    color: var(--color-canvas);
+  }
+
+  :focus-visible {
+    outline: 1px solid var(--color-ink);
+    outline-offset: 3px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* The page is drawn on a ruled grid: one content column framed by two
+     vertical hairlines that run the full height of the page. */
+  .frame {
+    position: relative;
+    margin-inline: auto;
+    width: min(100% - 2rem, 80rem);
+  }
+
+  .frame-rules {
+    border-inline: 1px solid var(--color-hairline);
+  }
+
+  .rule-top {
+    border-top: 1px solid var(--color-hairline);
+  }
+
+  /* A small square sits where a horizontal rule meets the frame. */
+  .corner-marks::before,
+  .corner-marks::after {
+    content: "";
+    position: absolute;
+    top: -3.5px;
+    width: 6px;
+    height: 6px;
+    background: var(--color-canvas);
+    border: 1px solid var(--color-hairline-strong);
+    z-index: 2;
+  }
+  .corner-marks::before {
+    left: -3.5px;
+  }
+  .corner-marks::after {
+    right: -3.5px;
+  }
+
+  .dot-grid {
+    background-image: radial-gradient(circle at 1px 1px, rgb(255 255 255 / 0.07) 1px, transparent 0);
+    background-size: 22px 22px;
+  }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}
