@@ -1,35 +1,40 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import { site } from "@/lib/site";
 import "./globals.css";
 
+const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
+const mono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-jetbrains", display: "swap" });
+
+const title = `${site.name} — AI agent for your desktop`;
+
 export const metadata: Metadata = {
   metadataBase: new URL(site.url),
-  title: `${site.name} — ${site.tagline}`,
+  title,
   description: site.description,
   icons: {
-    icon: "/favicon.ico",
-    shortcut: "/kylo-mark-256.png",
+    icon: [{ url: "/favicon.ico" }, { url: "/kylo-mark-256.png", type: "image/png" }],
     apple: "/kylo-mark-256.png",
   },
   openGraph: {
-    title: `${site.name} — ${site.tagline}`,
+    title,
     description: site.description,
     siteName: site.name,
-    images: [{ url: "/kylo-logo.png", width: 1024, height: 512, alt: "Kylo Logo" }],
     type: "website",
+    images: [{ url: "/kylo-mark-256.png", width: 256, height: 256, alt: "Kylo" }],
   },
+  twitter: { card: "summary", title, description: site.description },
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export const viewport: Viewport = {
+  themeColor: "#000000",
+  colorScheme: "dark",
+};
+
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className="dark">
-      <body className="min-h-screen bg-canvas text-ink antialiased selection:bg-white selection:text-black">
-        {children}
-      </body>
+    <html lang="en" className={`${inter.variable} ${mono.variable}`}>
+      <body>{children}</body>
     </html>
   );
 }

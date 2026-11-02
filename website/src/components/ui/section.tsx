@@ -38,7 +38,7 @@ type SectionHeaderProps = {
 export function SectionHeader({ eyebrow, title, aside, lede, align = "left", className }: SectionHeaderProps) {
   const centered = align === "center";
   return (
-    <Reveal className={cn("max-w-3xl", centered && "mx-auto text-center", className)}>
+    <Reveal className={cn("max-w-4xl", centered && "mx-auto text-center", className)}>
       <Eyebrow className={cn(centered && "justify-center")}>{eyebrow}</Eyebrow>
       <h2 className="mt-6 text-balance text-headline font-medium text-ink">
         {title}

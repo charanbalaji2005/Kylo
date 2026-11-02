@@ -73,7 +73,7 @@ export function Features() {
           <article
             key={f.title}
             className={cn(
-              "grid items-center gap-10 border-t border-hairline py-14 md:gap-14 md:py-20 lg:grid-cols-2 lg:gap-20",
+              "grid grid-cols-[minmax(0,1fr)] items-center gap-10 border-t border-hairline py-14 md:gap-14 md:py-20 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:gap-20",
               i === FEATURES.length - 1 && "pb-0 md:pb-0",
             )}
           >

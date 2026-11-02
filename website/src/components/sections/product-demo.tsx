@@ -50,7 +50,7 @@ export function ProductDemo() {
         <PromptBar />
       </Reveal>
 
-      <div className="mt-10 grid gap-10 lg:mt-14 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-16">
+      <div className="mt-10 grid grid-cols-[minmax(0,1fr)] gap-10 lg:mt-14 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-16">
         <ol className="relative">
           <span aria-hidden className="absolute bottom-6 left-[15px] top-6 w-px bg-hairline" />
           {STEPS.map((step, i) => (
@@ -141,7 +141,6 @@ function StepItem({
   useEffect(() => {
     if (inView) onActivate();
     // onActivate is a fresh closure each render; only the view change matters here.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inView]);
 
   return (

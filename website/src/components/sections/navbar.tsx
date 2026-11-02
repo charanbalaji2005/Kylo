@@ -21,7 +21,7 @@ export function Navbar() {
       className={cn(
         "fixed inset-x-0 top-0 z-50 border-b transition-[background-color,border-color,backdrop-filter] duration-300",
         scrolled || open
-          ? "border-hairline bg-canvas/70 backdrop-blur-xl backdrop-saturate-150"
+          ? "border-hairline bg-canvas/85 backdrop-blur-xl backdrop-saturate-150"
           : "border-transparent bg-transparent",
       )}
     >

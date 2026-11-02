@@ -49,7 +49,7 @@ const HISTORY = [
 export function Security() {
   return (
     <Section id="security">
-      <div className="grid gap-10 lg:grid-cols-2 lg:items-end">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-10 lg:grid-cols-2 lg:items-end">
         <SectionHeader eyebrow="Security" title="Your machine." aside="Your control." />
         <Reveal delay={0.1}>
           <p className="max-w-md text-pretty text-base leading-relaxed text-body lg:ml-auto">

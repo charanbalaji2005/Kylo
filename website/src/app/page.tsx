@@ -1,21 +1,29 @@
-import { Navbar } from "@/components/sections/navbar";
-import { Hero } from "@/components/sections/hero";
-import { Product } from "@/components/sections/product";
+import { Cta } from "@/components/sections/cta";
 import { Features } from "@/components/sections/features";
-import { DownloadSection } from "@/components/sections/download";
 import { Footer } from "@/components/sections/footer";
+import { Hero } from "@/components/sections/hero";
+import { Install } from "@/components/sections/install";
+import { Navbar } from "@/components/sections/navbar";
+import { ProductDemo } from "@/components/sections/product-demo";
+import { Security } from "@/components/sections/security";
+import { TerminalSupport } from "@/components/sections/terminal-support";
+import { Workflow } from "@/components/sections/workflow";
 
 export default function Home() {
   return (
-    <div className="relative min-h-screen bg-canvas">
+    <>
       <Navbar />
       <main>
         <Hero />
-        <Product />
+        <ProductDemo />
+        <TerminalSupport />
         <Features />
-        <DownloadSection />
+        <Security />
+        <Workflow />
+        <Install />
+        <Cta />
       </main>
       <Footer />
-    </div>
+    </>
   );
 }

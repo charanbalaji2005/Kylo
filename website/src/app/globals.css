@@ -23,7 +23,7 @@
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
   --font-mono: var(--font-jetbrains), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  --text-display: clamp(2.75rem, 1.4rem + 5.4vw, 6rem);
+  --text-display: clamp(2.375rem, 1.2rem + 5.6vw, 6rem);
   --text-display--line-height: 1;
   --text-display--letter-spacing: -0.045em;
   --text-headline: clamp(2rem, 1.3rem + 2.6vw, 3.5rem);

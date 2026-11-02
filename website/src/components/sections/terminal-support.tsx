@@ -53,11 +53,11 @@ const PANELS: Panel[] = [
     meta: "Ubuntu 24.04 · bash",
     variant: "linux",
     lines: [
-      { kind: "cmd", text: "df -h / | tail -1" },
+      { kind: "cmd", text: "df -h / | tail -1", cwd: "~/api" },
       { kind: "out", text: "/dev/sdc  1007G   48G  908G   5% /" },
-      { kind: "cmd", text: "docker compose up -d" },
-      { kind: "out", text: "✔ Container api-db-1   Started", tone: "strong" },
-      { kind: "out", text: "✔ Container api-web-1  Started", tone: "strong" },
+      { kind: "cmd", text: "docker compose up -d", cwd: "~/api" },
+      { kind: "out", text: "✓ Container api-db-1   Started", tone: "strong" },
+      { kind: "out", text: "✓ Container api-web-1  Started", tone: "strong" },
     ],
   },
   {
@@ -106,7 +106,7 @@ export function TerminalSupport() {
         lede="Kylo works in the shells already on your machine. Each task runs in a real terminal session you can open, read, and take over."
       />
 
-      <div className="mt-14 grid gap-px overflow-hidden rounded-xl border border-hairline bg-hairline md:mt-20 md:grid-cols-2">
+      <div className="mt-14 grid grid-cols-[minmax(0,1fr)] gap-px overflow-hidden rounded-xl border border-hairline bg-hairline md:mt-20 md:grid-cols-2">
         {PANELS.map((p, i) => (
           <Reveal key={p.name} delay={i * 0.08} y={16} className="bg-canvas">
             <TerminalPanel panel={p} />
