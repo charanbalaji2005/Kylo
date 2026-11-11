@@ -236,6 +236,13 @@ $InitialPath = $env:Path
 # Forward any extra args to installer.py (e.g. --no-launch, --dry-run, --with-voice-local)
 $ExtraArgs = $args
 
+# Fast CLI profile options:
+if ($env:KYLO_FAST -or $env:KYLO_CLI_ONLY -or ($env:KYLO_PROFILE -and $env:KYLO_PROFILE.ToLowerInvariant() -in @('cli', 'headless', 'fast')) -or $env:JARVIS_FAST -or $env:JARVIS_CLI_ONLY) {
+    if ($ExtraArgs -notcontains '--headless') {
+        $ExtraArgs += '--headless'
+    }
+}
+
 # --- prerequisite-bootstrap begin ------------------------------------------
 # This block stays shell-native because Python may not exist yet. Tests extract
 # it directly and exercise the retry/continuation state machine with fakes.
@@ -682,6 +689,15 @@ if ($null -eq $prerequisites) {
 }
 $pythonExe = $prerequisites.Python.Exe
 $pythonVer = "Python $($prerequisites.Python.Version)"
+
+# Python 3.14+ lacks pre-compiled wheels on PyPI for heavy desktop/voice C-extensions.
+# Auto-switch to fast, rock-solid CLI profile unless --with-desktop was explicitly passed.
+if ($prerequisites.Python.Version -match '^3\.(\d+)' -and [int]$Matches[1] -ge 14) {
+    if ($ExtraArgs -notcontains '--headless' -and $ExtraArgs -notcontains '--with-desktop') {
+        Write-Note 'Python 3.14+ detected: selecting fast CLI profile (heavy desktop wheels not on PyPI for 3.14)'
+        $ExtraArgs += '--headless'
+    }
+}
 
 # Node.js 18+ -- powers only the OPTIONAL agent worker CLIs (Claude
 # Code / Codex) that heavy missions delegate to, plus the Node-based

@@ -489,6 +489,16 @@ def is_update_run() -> bool:
 
 def step_models(*, full_profile: bool, dry_run: bool) -> None:
     phase("5/6", "Voice models")
+    if os.environ.get("KYLO_FAST") or os.environ.get("KYLO_SKIP_MODELS"):
+        if dry_run:
+            console.print("[muted]│    (dry-run) voice models skipped (fast profile)[/]")
+        note("voice models skipped (fast profile - downloads on-demand when voice is activated)")
+        return
+    if not full_profile and sys.platform == "win32" and sys.version_info >= (3, 14):
+        if dry_run:
+            console.print("[muted]│    (dry-run) voice models skipped (Python 3.14+ CLI profile)[/]")
+        note("voice models skipped (Python 3.14 fast profile - models download on-demand if needed)")
+        return
     note("downloading everything the voice pipeline needs, so the first")
     note("launch is ready immediately - nothing is fetched at startup")
     cmd = [str(venv_python()), "-m", "kylo", "--prefetch"]
@@ -1089,6 +1099,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="don't launch the Desktop App at the end")
     parser.add_argument("--headless", action="store_true",
                         help="install headless (no GUI extras, no App launch)")
+    parser.add_argument("--cli", dest="headless", action="store_true",
+                        help="fast CLI-only install (skip heavy desktop/voice extras)")
+    parser.add_argument("--fast", dest="headless", action="store_true",
+                        help="fast install profile (alias for --headless)")
     parser.add_argument("--with-desktop", action="store_true",
                         help="install [desktop] extras (default: auto-detect by platform)")
     parser.add_argument("--with-voice-local", action="store_true",
@@ -1102,10 +1116,23 @@ def main(argv: list[str] | None = None) -> int:
         note("--with-voice-local is deprecated: the full profile already "
              "includes local voice.")
 
-    # Auto-pick desktop extras unless the user said --headless or we're on a
-    # headless Linux VPS. (--with-desktop forces it on either way.)
+    is_cli_fast = (
+        bool(os.environ.get("KYLO_FAST"))
+        or bool(os.environ.get("KYLO_CLI_ONLY"))
+        or os.environ.get("KYLO_PROFILE", "").lower() in {"cli", "headless", "fast"}
+        or bool(os.environ.get("JARVIS_FAST"))
+        or bool(os.environ.get("JARVIS_CLI_ONLY"))
+        or os.environ.get("JARVIS_PROFILE", "").lower() in {"cli", "headless", "fast"}
+    )
+
+    # Auto-pick desktop extras unless the user said --headless/--cli, fast mode requested,
+    # or we're on a headless Linux VPS or Windows on Python 3.14+ (where heavy C-extension
+    # wheels in [full] are not yet published on PyPI). (--with-desktop forces it on either way.)
     if not args.with_desktop:
-        if args.headless or is_headless_linux():
+        if args.headless or is_headless_linux() or is_cli_fast:
+            with_desktop = False
+        elif sys.platform == "win32" and sys.version_info >= (3, 14):
+            note("Python 3.14+ on Windows detected: defaulting to fast lean CLI profile")
             with_desktop = False
         else:
             with_desktop = sys.platform in {"win32", "darwin"} or sys.platform.startswith(
