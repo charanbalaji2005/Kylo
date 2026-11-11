@@ -11,6 +11,15 @@ versioning per [SemVer](https://semver.org/).
 
 ---
 
+## [4.1.4] — 2026-11-11
+
+### Added
+
+- Added `klyo` and `klyoctl` as primary CLI entrypoints while retaining full backward compatibility for `kylo`, `kyloctl`, `jarvis`, and `jctl`.
+- Added standalone Windows desktop application release CI/CD workflow (`release-desktop.yml`) publishing NSIS installers (`Kylo-Setup-*-x64.exe` and `Klyo-Setup-*-x64.exe`) and CLI tools to GitHub Releases.
+
+---
+
 ## [4.1.3] — 2026-11-02
 
 ### Changed

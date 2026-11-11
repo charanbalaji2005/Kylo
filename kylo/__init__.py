@@ -1,6 +1,6 @@
 """Kylo — a voice-driven, cross-platform meta-orchestrator."""
 
-__version__ = "4.1.3"
+__version__ = "4.1.4"
 
 import os as _os
 
