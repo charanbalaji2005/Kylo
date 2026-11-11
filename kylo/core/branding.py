@@ -239,10 +239,10 @@ LEGACY_LINUX_WM_CLASSES = (PERSISTENT_SLUG,)
 PLUGIN_GROUP_NAMESPACE = "kylo"
 LEGACY_PLUGIN_GROUP_NAMESPACES = ("jarvis",)
 
-DEFAULT_OFFICIAL_REPO_SLUG = "Kylo/Kylo"
+DEFAULT_OFFICIAL_REPO_SLUG = "charanbalaji2005/Kylo"
 # Checkouts cloned before the GitHub rename still store this origin. The
 # updater accepts it and rewrites origin to the current slug when it applies.
-LEGACY_OFFICIAL_REPO_SLUGS = ("PersonalJarvis/PersonalJarvis",)
+LEGACY_OFFICIAL_REPO_SLUGS = ("Kylo/Kylo", "PersonalJarvis/PersonalJarvis")
 OFFICIAL_REPO_SLUG_ENV_VAR = "JARVIS_OFFICIAL_REPO_SLUG"
 
 

@@ -94,13 +94,13 @@ _CURRENT_IDENTITY = {
     "LEGACY_LINUX_DESKTOP_ENTRY_FILE_NAMES": ("personal-jarvis.desktop",),
     "LINUX_WM_CLASS": "kylo",
     "LEGACY_LINUX_WM_CLASSES": ("personal-jarvis",),
-    "DEFAULT_OFFICIAL_REPO_SLUG": "Kylo/Kylo",
+    "DEFAULT_OFFICIAL_REPO_SLUG": "charanbalaji2005/Kylo",
     "OFFICIAL_REPO_SLUG_ENV_VAR": "JARVIS_OFFICIAL_REPO_SLUG",
-    "OFFICIAL_REPO_SLUG": "Kylo/Kylo",
-    "OFFICIAL_REPO_URL": "https://github.com/Kylo/Kylo",
-    "OFFICIAL_REPO_GIT_URL": "https://github.com/Kylo/Kylo.git",
+    "OFFICIAL_REPO_SLUG": "charanbalaji2005/Kylo",
+    "OFFICIAL_REPO_URL": "https://github.com/charanbalaji2005/Kylo",
+    "OFFICIAL_REPO_GIT_URL": "https://github.com/charanbalaji2005/Kylo.git",
     "OFFICIAL_RELEASES_LATEST_API_URL": (
-        "https://api.github.com/repos/Kylo/Kylo/releases/latest"
+        "https://api.github.com/repos/charanbalaji2005/Kylo/releases/latest"
     ),
     "UPDATER_USER_AGENT": "Kylo-Updater",
     "HTTP_USER_AGENT": "Kylo/1.0",

@@ -92,8 +92,8 @@ def test_the_launcher_help_says_kylo_when_run_as_a_module(
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["/repo/kylo/__main__.py"])
 
-    assert entry._build_parser().prog == "kylo"
-    assert app_update.build_parser().prog == "kylo update"
+    assert entry._build_parser().prog == "klyo"
+    assert app_update.build_parser().prog == "klyo update"
 
 
 def test_the_update_command_help_names_the_invoked_command(
