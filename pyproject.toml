@@ -515,18 +515,18 @@ tts-eval = [
 # `kyloapp` or `personaljarvis` alias): Windows paths ignore case, and the
 # venv's Scripts folder holds `KyloApp.exe` (and `PersonalJarvis.exe` from
 # earlier releases).
-klyo = "kylo.__main__:main"
 kylo = "kylo.__main__:main"
+klyo = "kylo.__main__:main"
 jarvis = "kylo.__main__:main"
 personal-jarvis = "kylo.__main__:main"
 # Phase 8.5 — Review-Pipeline-Run-GC (Plan §6.5).
 jarvis-review-gc = "kylo.cli.review_gc:main"
 # Phase 8.6 — Review-Pipeline-Eval-Harness (Plan §6.6).
 jarvis-review-eval = "kylo.cli.review_eval:main"
-# klyoctl / kyloctl — control CLI for a running Kylo/Klyo instance. `jarvisctl` and
+# kyloctl / klyoctl — control CLI for a running Kylo/Klyo instance. `jarvisctl` and
 # `jctl` are its earlier names and stay.
-klyoctl = "kylo.cli_ctl.__main__:main"
 kyloctl = "kylo.cli_ctl.__main__:main"
+klyoctl = "kylo.cli_ctl.__main__:main"
 jarvisctl = "kylo.cli_ctl.__main__:main"
 jctl = "kylo.cli_ctl.__main__:main"
 

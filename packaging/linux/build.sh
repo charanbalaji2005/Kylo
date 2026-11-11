@@ -1,37 +1,4 @@
-#!/usr/bin/env bash
-#
-# Build the distributable Linux AppImage for Kylo.
-#
-#   packaging/linux/build.sh
-#
-# Output (per the release contract):
-#   dist/installers/Kylo-Linux-x86_64.AppImage
-#   dist/installers/kylo_<version>_amd64.deb           (when dpkg-deb exists)
-#
-# The installed names are already the current ones: the Debian package
-# "kylo" (it replaces the earlier "personal-jarvis" package), /opt/Kylo,
-# kylo.desktop and the kylo icon. A release also publishes the AppImage
-# as PersonalJarvis-Linux-x86_64.AppImage, a byte-identical copy for installs
-# from before the rename (scripts/ci/installer_aliases.py).
-#
-# The AppImage is one downloadable file that needs no Python, no pip and no
-# system packages: double-click it to run the app, or call it like the CLI
-# ("./Kylo-Linux-x86_64.AppImage serve"). Both entry points come out
-# of the same PyInstaller onedir freeze.
-#
-# What this AppImage does NOT contain is a native desktop window - read
-# packaging/linux/README.md before changing that; it is a deliberate decision,
-# not an oversight.
-#
-# Knobs:
-#   DRY_RUN=1          print every command instead of running it
-#   PYTHON=...         interpreter to build with (default: python3)
-#   SKIP_FRONTEND=1    never run npm, even when the web bundle is missing
-#   SKIP_PYINSTALLER=1 reuse the freeze already in FREEZE_DIR
-#   FREEZE_DIR=...     PyInstaller onedir output (default: dist/Jarvis)
-#   BUILD_DEB=0        skip the .deb even when dpkg-deb is installed
-#   APPIMAGETOOL=...   use this appimagetool binary instead of downloading one
-#
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,7 +29,7 @@ ICON_SOURCE="${REPO_ROOT}/assets/icons/kylo-gigi-256.png"
 # (kylo/core/branding.py: LINUX_DESKTOP_ENTRY_FILE_NAME, LINUX_WM_CLASS).
 DESKTOP_FILE_NAME="kylo.desktop"
 # The console command and its earlier name; both ship (kylo.spec builds both).
-CLI_EXE_NAMES=("klyo" "kylo")
+CLI_EXE_NAMES=("kylo" "klyo")
 ICON_FILE_NAME="kylo.png"
 # usr/share/<name> inside the AppDir; AppRun reads its browser-ui marker there.
 SHARE_DIR_NAME="kylo"

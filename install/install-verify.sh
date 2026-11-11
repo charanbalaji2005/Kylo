@@ -67,7 +67,7 @@ set -euo pipefail
 
 # Owning repo (for the OIDC identity regex). The override supports an official
 # repository move while keeping the current identity as the fail-closed default.
-readonly DEFAULT_OFFICIAL_REPO_SLUG="Kylo/Kylo"
+readonly DEFAULT_OFFICIAL_REPO_SLUG="charanbalaji2005/Kylo"
 EXPECTED_REPO="${JARVIS_OFFICIAL_REPO_SLUG:-$DEFAULT_OFFICIAL_REPO_SLUG}"
 if [[ ! "$EXPECTED_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
     printf 'JARVIS_OFFICIAL_REPO_SLUG must be an exact owner/repository slug\n' >&2

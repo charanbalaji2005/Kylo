@@ -38,9 +38,9 @@ jobs:
       - name: Verify CLI Command Names and Identity
         shell: bash
         run: |
-          pytest tests/unit/core/test_branding.py tests/unit/cli/test_command_name.py tests/unit/core/test_identity_single_source.py
+          pytest tests/unit/core/test_branding.py tests/unit/cli/test_command_name.py tests/unit/core/test_identity_single_source.py tests/unit/install/test_branding_contract.py
 
-      - name: Test klyo CLI execution
+      - name: Test kylo CLI execution
         shell: bash
         run: |
           python -m kylo --help

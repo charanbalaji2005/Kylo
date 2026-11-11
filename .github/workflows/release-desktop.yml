@@ -98,13 +98,14 @@ jobs:
           echo "PyInstaller output verified:"
           ls -la dist/Jarvis/*.exe
 
-      - name: Package CLI Distribution (klyo CLI tools)
+      - name: Package CLI Distribution (kylo & klyo CLI tools)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "dist/cli-package" -Force | Out-Null
           Copy-Item -Path "dist/Jarvis/*" -Destination "dist/cli-package" -Recurse -Force
-          Compress-Archive -Path "dist/cli-package/*" -DestinationPath "dist/klyo-cli-windows-x64.zip" -Force
-          Write-Host "Created dist/klyo-cli-windows-x64.zip"
+          Compress-Archive -Path "dist/cli-package/*" -DestinationPath "dist/kylo-cli-windows-x64.zip" -Force
+          Copy-Item "dist/kylo-cli-windows-x64.zip" "dist/klyo-cli-windows-x64.zip" -Force
+          Write-Host "Created dist/kylo-cli-windows-x64.zip and dist/klyo-cli-windows-x64.zip"
 
       - name: Build Electron Desktop Installer
         shell: pwsh
@@ -135,7 +136,7 @@ jobs:
         run: |
           $releaseFiles = @()
           $releaseFiles += Get-ChildItem -Path "desktop/release" -Filter "*.exe"
-          $releaseFiles += Get-ChildItem -Path "dist" -Filter "klyo-cli-*.zip"
+          $releaseFiles += Get-ChildItem -Path "dist" -Filter "*-cli-*.zip"
           $lines = @()
           foreach ($file in $releaseFiles) {
             $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
@@ -151,7 +152,7 @@ jobs:
           path: |
             desktop/release/*.exe
             desktop/release/*.blockmap
-            dist/klyo-cli-windows-x64.zip
+            dist/*-cli-*.zip
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
@@ -169,5 +170,5 @@ jobs:
           files: |
             desktop/release/*.exe
             desktop/release/*.blockmap
-            dist/klyo-cli-windows-x64.zip
+            dist/*-cli-*.zip
             SHA256SUMS.txt

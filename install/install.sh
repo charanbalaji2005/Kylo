@@ -48,7 +48,7 @@ adopt_install_option_names
 
 # Standalone bootstrap projections of kylo/core/branding.py. The branding
 # contract test rejects drift because this script runs before Python is installed.
-OFFICIAL_REPO_SLUG="${JARVIS_OFFICIAL_REPO_SLUG:-Kylo/Kylo}"
+OFFICIAL_REPO_SLUG="${JARVIS_OFFICIAL_REPO_SLUG:-charanbalaji2005/Kylo}"
 if [[ ! "$OFFICIAL_REPO_SLUG" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
     printf 'JARVIS_OFFICIAL_REPO_SLUG must be an exact owner/repository slug\n' >&2
     exit 2

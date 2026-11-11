@@ -1,4 +1,4 @@
-# Personal Jarvis — verifying one-liner for Windows (Wave 3 supply-chain).
+﻿# Personal Jarvis — verifying one-liner for Windows (Wave 3 supply-chain).
 #
 # Usage:
 #   irm https://github.com/charanbalaji2005/Kylo/releases/download/<TAG>/install-verify.ps1 | iex
@@ -51,7 +51,7 @@ $ErrorActionPreference = 'Stop'
 
 # ------------------------------------------------------------------- pins
 $EXPECTED_REPO = "$env:JARVIS_OFFICIAL_REPO_SLUG"
-if (-not $EXPECTED_REPO) { $EXPECTED_REPO = 'Kylo/Kylo' }
+if (-not $EXPECTED_REPO) { $EXPECTED_REPO = 'charanbalaji2005/Kylo' }
 if ($EXPECTED_REPO -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw 'JARVIS_OFFICIAL_REPO_SLUG must be an exact owner/repository slug'
 }

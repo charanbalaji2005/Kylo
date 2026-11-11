@@ -1,30 +1,4 @@
-# Kylo - Windows quick-install bootstrap (Stage 1)
-#
-# Usage (from PowerShell):
-#   irm https://raw.githubusercontent.com/charanbalaji2005/Kylo/main/install/install.ps1 | iex
-#
-# This bootstrap is intentionally small. It:
-#   1. Uses Python 3.11+ and git when they are installed.
-#   2. Otherwise fetches private, checksum-pinned copies (uv-managed Python,
-#      MinGit) into %LOCALAPPDATA%\Kylo\tools - no admin rights, no
-#      prompt - and offers WinGet only when that download fails.
-#   3. Checks for Node.js 18+ (optional - a missing Node never blocks the install).
-#   4. Clones (or updates) Kylo into ~\.kylo (an update moves an install
-#      made under the earlier name ~\.personal-jarvis there).
-#   5. Creates a Python venv, installs `rich` + `packaging`.
-#   6. Hands control to install/installer.py (the Stage 2 orchestrator).
-#
-# All heavy logic lives in installer.py so it can be unit-tested and
-# kept cross-platform. The shell-native prerequisite block is delimited so it
-# can be tested directly even on machines where Python is not installed yet.
-#
-# SOURCE-ENCODING RULE: this file is served BOM-less (a BOM breaks
-# `irm | iex`), and Windows PowerShell then reads it as cp1252. So the
-# source OUTSIDE the banner here-string stays pure ASCII: the glyphs (bullet,
-# check, cross) are built from code points at runtime, never pasted as
-# literals -- a literal check/dash would cp1252-decode into a smart quote and
-# break tokenizing. Console output is forced to UTF-8 so they still render.
-
+﻿
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
@@ -166,14 +140,12 @@ OzU7NTht4paA4paAG1swbSAgICAgG1swbRtbMzg7NTsxMDBt4paAG1swbSAgICAbWzBt
     # rows carry ONE continuous vertical gradient (hi -> brand -> deep) so the
     # word reads as a single forged-gold wordmark.
     $art = @"
-
-$GoldHi       ██████╗  ██████╗ ██████╗  █████╗ ██╗ ██████╗ ███████╗$Rst
-$GoldHi       ██╔══██╗██╔═══██╗██╔══██╗██╔══██╗██║██╔═══██╗██╔════╝$Rst
-$Gold       ██║  ██║██║   ██║██║  ██║███████║██║██║   ██║███████╗$Rst
-$Gold       ██║  ██║██║   ██║██║  ██║██╔══██║██║██║   ██║╚════██║$Rst
-$GoldDeep       ██████╔╝╚██████╔╝██████╔╝██║  ██║██║╚██████╔╝███████║$Rst
-$GoldDeep       ╚═════╝  ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝ ╚═════╝ ╚══════╝$Rst
-
+$GoldHi       ██╗  ██╗██╗   ██╗██╗      ██████╗ $Rst
+$GoldHi       ██║ ██╔╝╚██╗ ██╔╝██║     ██╔═══██╗$Rst
+$Gold         █████═╝  ╚████╔╝ ██║     ██║   ██║$Rst
+$Gold         ██╔═██╗   ╚██╔╝  ██║     ██║   ██║$Rst
+$GoldDeep     ██║  ██╗   ██║   ███████╗╚██████╔╝$Rst
+$GoldDeep     ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝ $Rst
 $Dim     talk to your computer · installs the full profile · launches when done$Rst
 
 $Dim┌$Rst  ${Gold}Kylo installer$Rst
@@ -216,7 +188,7 @@ Use-InstallOptionNames
 # Standalone bootstrap projections of kylo/core/branding.py. The branding
 # contract test rejects drift because this script runs before Python is installed.
 $OfficialRepoSlug = "$env:JARVIS_OFFICIAL_REPO_SLUG"
-if (-not $OfficialRepoSlug) { $OfficialRepoSlug = 'Kylo/Kylo' }
+if (-not $OfficialRepoSlug) { $OfficialRepoSlug = 'charanbalaji2005/Kylo' }
 if ($OfficialRepoSlug -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
     throw 'JARVIS_OFFICIAL_REPO_SLUG must be an exact owner/repository slug'
 }

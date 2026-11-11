@@ -37,11 +37,11 @@ from kylo.core.branding import (
         ("/home/u/.local/bin/JARVIS.EXE", "jarvis"),
         ("/usr/bin/personal-jarvis", "personal-jarvis"),
         # Anything else is not a command name of ours: the primary name.
-        ("/repo/kylo/__main__.py", "klyo"),
-        ("/Applications/Personal Jarvis.app/Contents/MacOS/PersonalJarvis", "klyo"),
-        ("/opt/venv/bin/jarvisctl", "klyo"),
-        ("-c", "klyo"),
-        ("", "klyo"),
+        ("/repo/kylo/__main__.py", "kylo"),
+        ("/Applications/Personal Jarvis.app/Contents/MacOS/PersonalJarvis", "kylo"),
+        ("/opt/venv/bin/jarvisctl", "kylo"),
+        ("-c", "kylo"),
+        ("", "kylo"),
     ],
 )
 def test_the_command_name_follows_how_the_process_was_started(argv0: str, expected: str) -> None:
@@ -56,7 +56,7 @@ def test_the_command_name_follows_how_the_process_was_started(argv0: str, expect
         (r"C:\Users\u\.personal-jarvis\bin\kylo.exe", "kylo"),
         (r"C:\Users\u\.personal-jarvis\bin\JARVIS.EXE", "jarvis"),
         (r"C:\Users\u\.personal-jarvis\bin\personal-jarvis.exe", "personal-jarvis"),
-        (r"C:\Program Files\Personal Jarvis\PersonalJarvis.exe", "klyo"),
+        (r"C:\Program Files\Personal Jarvis\PersonalJarvis.exe", "kylo"),
     ],
 )
 def test_the_command_name_is_read_from_a_windows_launcher_path(argv0: str, expected: str) -> None:
@@ -64,9 +64,9 @@ def test_the_command_name_is_read_from_a_windows_launcher_path(argv0: str, expec
 
 
 def test_the_primary_name_is_the_branding_constant() -> None:
-    assert main_command("") == CLI_COMMAND_NAME == "klyo"
-    assert CONTROL_CLI_COMMAND_NAME == "klyoctl"
-    assert LEGACY_CLI_COMMAND_NAMES == ("kylo", "jarvis", "personal-jarvis")
+    assert main_command("") == CLI_COMMAND_NAME == "kylo"
+    assert CONTROL_CLI_COMMAND_NAME == "kyloctl"
+    assert LEGACY_CLI_COMMAND_NAMES == ("klyo", "jarvis", "personal-jarvis")
 
 
 @pytest.mark.parametrize("command", ["klyo", "kylo", "jarvis", "personal-jarvis"])
@@ -92,8 +92,8 @@ def test_the_launcher_help_says_kylo_when_run_as_a_module(
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["/repo/kylo/__main__.py"])
 
-    assert entry._build_parser().prog == "klyo"
-    assert app_update.build_parser().prog == "klyo update"
+    assert entry._build_parser().prog == "kylo"
+    assert app_update.build_parser().prog == "kylo update"
 
 
 def test_the_update_command_help_names_the_invoked_command(

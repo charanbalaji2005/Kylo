@@ -55,10 +55,10 @@ GUI_EXE_NAME = "KyloApp"
 # starts `{app}\PersonalJarvis.exe`, and must keep finding it.
 LEGACY_GUI_EXE_NAMES = ("PersonalJarvis",)
 # Console entry point. Same name as the pip console script on purpose.
-CLI_EXE_NAME = "klyo"
+CLI_EXE_NAME = "kylo"
 # The console entry point under its earlier name, built from the same program.
 # No name here may equal a GUI name ignoring case: they share one folder.
-LEGACY_CLI_EXE_NAMES = ("kylo",)
+LEGACY_CLI_EXE_NAMES = ("klyo",)
 
 # The Python distribution this tree is installed as, current name first
 # (kylo.core.branding.DISTRIBUTION_NAMES). An environment set up before the

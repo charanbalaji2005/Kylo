@@ -66,10 +66,10 @@
 ; before the rename (scripts/ci/installer_aliases.py).
 #define SignedProductName "Kylo"
 #define SignedSetupBaseName "Kylo-Setup-x64"
-#define CliExeName "klyo.exe"
+#define CliExeName "kylo.exe"
 ; The command's earlier name. The bundle ships it beside CliExeName, in the
 ; same folder the PATH task adds, so both names work in a terminal.
-#define LegacyCliExeName "kylo.exe"
+#define LegacyCliExeName "klyo.exe"
 #define UserDataDirDisplay "%LOCALAPPDATA%\Kylo"
 
 [Setup]
