@@ -1017,13 +1017,13 @@ markers = [
 ]
 
 # Only cryptography may resolve through the reviewed native wheel index.
-[[tool.uv.index]]
-name = "native-crypto"
-url = "https://kylo.github.io/Kylo/native-crypto/50.0.2-1/simple/"
-explicit = true
+# [[tool.uv.index]]
+# name = "native-crypto"
+# url = "https://kylo.github.io/Kylo/native-crypto/50.0.2-1/simple/"
+# explicit = true
 
-[tool.uv.sources]
-cryptography = { index = "native-crypto" }
+# [tool.uv.sources]
+# cryptography = { index = "native-crypto" }
 
 # sherpa-onnx wheels disagree on their metadata: the linux_armv7l wheel bundles
 # the native core, every other wheel requires sherpa-onnx-core of the same

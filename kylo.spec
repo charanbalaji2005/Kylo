@@ -339,6 +339,16 @@ excludes = [
     "notebook",
     "torch.test",
     "tornado",
+    "sklearn",
+    "scikit-learn",
+    "cupy",
+    "dask",
+    "scipy.spatial",
+    "scipy.stats",
+    "scipy.optimize",
+    "scipy.integrate",
+    "scipy.interpolate",
+    "scipy.ndimage",
     # Development-only. They arrive through the `[dev]` extra that the build
     # machine installs (PyInstaller itself lives there too), and every one of
     # them is dead weight in a shipped app - mypy alone is tens of megabytes of
