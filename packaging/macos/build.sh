@@ -264,7 +264,7 @@ log "running PyInstaller"
 if building; then
   [ -d "${APP_BUNDLE}" ] || die "PyInstaller did not produce '${APP_BUNDLE}'. kylo.spec must contain a darwin BUNDLE(...) block that names the app '${APP_NAME}'."
   # The console command and its earlier name; kylo.spec builds both.
-  for cli_name in kylo jarvis; do
+  for cli_name in klyo kylo; do
     [ -x "${APP_BUNDLE}/Contents/MacOS/${cli_name}" ] \
       || die "'${APP_BUNDLE}/Contents/MacOS/${cli_name}' is missing. The bundle must ship the console CLI entry so '${cli_name} serve' works from a native install."
   done

@@ -94,12 +94,12 @@ DISTRIBUTION_NAMES = (DISTRIBUTION_NAME, *LEGACY_DISTRIBUTION_NAMES)
 # Terminal commands the install puts on PATH. No command may equal the branded
 # launcher's name ignoring case: on Windows and macOS they would be one file.
 # The first two are the names help text, hints and documentation use.
-CLI_COMMAND_NAME = "kylo"
-CONTROL_CLI_COMMAND_NAME = "kyloctl"
+CLI_COMMAND_NAME = "klyo"
+CONTROL_CLI_COMMAND_NAME = "klyoctl"
 # Earlier names of the two commands. They stay installed and keep working:
 # scripts, shell history and other tools call them.
-LEGACY_CLI_COMMAND_NAMES = ("jarvis", PERSISTENT_SLUG)
-LEGACY_CONTROL_CLI_COMMAND_NAMES = ("jarvisctl",)
+LEGACY_CLI_COMMAND_NAMES = ("kylo", "jarvis", PERSISTENT_SLUG)
+LEGACY_CONTROL_CLI_COMMAND_NAMES = ("kyloctl", "jarvisctl")
 CLI_COMMAND_NAMES = (
     CLI_COMMAND_NAME,
     CONTROL_CLI_COMMAND_NAME,
@@ -111,7 +111,7 @@ CLI_COMMAND_NAMES = (
 # and on uninstall, so the line keeps the spelling existing profiles carry: it
 # names the earlier commands, and the block puts every command on PATH.
 SHELL_PROFILE_MARKER = (
-    f"# {PERSISTENT_PRODUCT_NAME}: command-line tools ({', '.join(LEGACY_CLI_COMMAND_NAMES)})"
+    f"# {PERSISTENT_PRODUCT_NAME}: command-line tools (jarvis, {PERSISTENT_SLUG})"
 )
 FISH_CONF_FILE_NAME = f"{PERSISTENT_SLUG}.fish"
 

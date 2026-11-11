@@ -275,7 +275,7 @@ _EARLIER_FISH_BLOCK = (
 
 
 def test_the_new_commands_are_on_the_list_beside_the_earlier_ones():
-    assert COMMAND_NAMES[:2] == ("kylo", "kyloctl")
+    assert COMMAND_NAMES[:2] == ("klyo", "klyoctl")
     assert set(_EARLIER_COMMANDS) < set(COMMAND_NAMES)
 
 

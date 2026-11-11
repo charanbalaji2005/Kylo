@@ -158,7 +158,7 @@ def test_the_debian_package_installs_under_the_current_names() -> None:
     assert "usr/share/personal-jarvis" not in script
     # The commands: the current CLI and its earlier names, and the earlier
     # command that opens the app.
-    assert '\nCLI_EXE_NAMES=("kylo" "jarvis")\n' in script
+    assert '\nCLI_EXE_NAMES=("klyo" "kylo")\n' in script
     assert (
         'ln -sf "${DEB_INSTALL_DIR}/usr/bin/${cli_name}" "${DEB_ROOT}/usr/bin/${cli_name}"'
         in script

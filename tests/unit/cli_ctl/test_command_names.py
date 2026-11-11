@@ -17,7 +17,7 @@ from kylo import __version__
 from kylo.cli_ctl.__main__ import app, build_root_command
 from kylo.core.branding import CONTROL_CLI_COMMAND_NAME
 
-_NAMES = ["kyloctl", "jarvisctl", "jctl", "kylo", "jarvis"]
+_NAMES = ["klyoctl", "kyloctl", "jarvisctl", "jctl", "klyo", "kylo", "jarvis"]
 _STYLE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -27,7 +27,7 @@ def _plain(text: str) -> str:
 
 
 def test_the_control_app_is_named_after_the_primary_command() -> None:
-    assert app.info.name == CONTROL_CLI_COMMAND_NAME == "kyloctl"
+    assert app.info.name == CONTROL_CLI_COMMAND_NAME == "klyoctl"
 
 
 @pytest.mark.parametrize("name", _NAMES)

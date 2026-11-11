@@ -26,6 +26,9 @@ from kylo.core.branding import (
 @pytest.mark.parametrize(
     ("argv0", "expected"),
     [
+        ("klyo", "klyo"),
+        ("/home/u/.local/bin/klyo", "klyo"),
+        ("/home/u/.local/bin/klyo.exe", "klyo"),
         ("kylo", "kylo"),
         ("/home/u/.local/bin/kylo", "kylo"),
         ("/home/u/.local/bin/kylo.exe", "kylo"),
@@ -34,11 +37,11 @@ from kylo.core.branding import (
         ("/home/u/.local/bin/JARVIS.EXE", "jarvis"),
         ("/usr/bin/personal-jarvis", "personal-jarvis"),
         # Anything else is not a command name of ours: the primary name.
-        ("/repo/kylo/__main__.py", "kylo"),
-        ("/Applications/Personal Jarvis.app/Contents/MacOS/PersonalJarvis", "kylo"),
-        ("/opt/venv/bin/jarvisctl", "kylo"),
-        ("-c", "kylo"),
-        ("", "kylo"),
+        ("/repo/kylo/__main__.py", "klyo"),
+        ("/Applications/Personal Jarvis.app/Contents/MacOS/PersonalJarvis", "klyo"),
+        ("/opt/venv/bin/jarvisctl", "klyo"),
+        ("-c", "klyo"),
+        ("", "klyo"),
     ],
 )
 def test_the_command_name_follows_how_the_process_was_started(argv0: str, expected: str) -> None:
@@ -49,10 +52,11 @@ def test_the_command_name_follows_how_the_process_was_started(argv0: str, expect
 @pytest.mark.parametrize(
     ("argv0", "expected"),
     [
+        (r"C:\Users\u\.personal-jarvis\bin\klyo.exe", "klyo"),
         (r"C:\Users\u\.personal-jarvis\bin\kylo.exe", "kylo"),
         (r"C:\Users\u\.personal-jarvis\bin\JARVIS.EXE", "jarvis"),
         (r"C:\Users\u\.personal-jarvis\bin\personal-jarvis.exe", "personal-jarvis"),
-        (r"C:\Program Files\Personal Jarvis\PersonalJarvis.exe", "kylo"),
+        (r"C:\Program Files\Personal Jarvis\PersonalJarvis.exe", "klyo"),
     ],
 )
 def test_the_command_name_is_read_from_a_windows_launcher_path(argv0: str, expected: str) -> None:
@@ -60,12 +64,12 @@ def test_the_command_name_is_read_from_a_windows_launcher_path(argv0: str, expec
 
 
 def test_the_primary_name_is_the_branding_constant() -> None:
-    assert main_command("") == CLI_COMMAND_NAME == "kylo"
-    assert CONTROL_CLI_COMMAND_NAME == "kyloctl"
-    assert LEGACY_CLI_COMMAND_NAMES == ("jarvis", "personal-jarvis")
+    assert main_command("") == CLI_COMMAND_NAME == "klyo"
+    assert CONTROL_CLI_COMMAND_NAME == "klyoctl"
+    assert LEGACY_CLI_COMMAND_NAMES == ("kylo", "jarvis", "personal-jarvis")
 
 
-@pytest.mark.parametrize("command", ["kylo", "jarvis", "personal-jarvis"])
+@pytest.mark.parametrize("command", ["klyo", "kylo", "jarvis", "personal-jarvis"])
 def test_the_launcher_help_names_the_invoked_command(
     command: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

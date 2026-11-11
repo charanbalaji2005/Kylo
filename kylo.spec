@@ -8,10 +8,10 @@
 #     * a windowed GUI launcher (Start Menu / Applications / .desktop), built a
 #       second time under its earlier name `PersonalJarvis`, because taskbar
 #       pins, logon tasks and shortcuts of earlier releases name that file, and
-#     * a console CLI named `kylo`, so `kylo serve`, `kylo --version`,
-#       `kylo missions list` behave exactly like the pip console script.
-#       The same console program is built a second time as `jarvis`, the
-#       command's earlier name, which scripts and shell history still call.
+#     * a console CLI named `klyo`, so `klyo serve`, `klyo --version`,
+#       `klyo missions list` behave exactly like the pip console script.
+#       The same console program is built a second time as `kylo` and `jarvis`, the
+#       command's earlier names, which scripts and shell history still call.
 #   All of them run `kylo/__main__.py`; only the console flag differs.
 # - The GUI binary is `KyloApp`, not `Kylo`: `Kylo` and `kylo`
 #   are the SAME path on Windows (NTFS) and on a default macOS APFS volume, so
@@ -55,10 +55,10 @@ GUI_EXE_NAME = "KyloApp"
 # starts `{app}\PersonalJarvis.exe`, and must keep finding it.
 LEGACY_GUI_EXE_NAMES = ("PersonalJarvis",)
 # Console entry point. Same name as the pip console script on purpose.
-CLI_EXE_NAME = "kylo"
+CLI_EXE_NAME = "klyo"
 # The console entry point under its earlier name, built from the same program.
 # No name here may equal a GUI name ignoring case: they share one folder.
-LEGACY_CLI_EXE_NAMES = ("jarvis",)
+LEGACY_CLI_EXE_NAMES = ("kylo",)
 
 # The Python distribution this tree is installed as, current name first
 # (kylo.core.branding.DISTRIBUTION_NAMES). An environment set up before the
@@ -144,7 +144,10 @@ if FRONTEND_DIST.exists():
 # hook copies it to the per-user app directory on first launch (as kylo.toml
 # when that directory has no jarvis.toml of its own); the frozen app never reads
 # or writes the copy inside the bundle.
-datas.append((str(PROJECT_ROOT / "jarvis.toml"), "."))
+if (PROJECT_ROOT / "kylo.toml").is_file():
+    datas.append((str(PROJECT_ROOT / "kylo.toml"), "."))
+elif (PROJECT_ROOT / "jarvis.toml").is_file():
+    datas.append((str(PROJECT_ROOT / "jarvis.toml"), "."))
 datas.append((str(PROJECT_ROOT / "docs" / "product"), "docs/product"))
 # The onboarding terms and redistribution notices must survive freezing.
 # Source-tree references in NOTICE are useful only when their target texts ship.

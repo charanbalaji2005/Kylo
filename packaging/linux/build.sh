@@ -62,7 +62,7 @@ ICON_SOURCE="${REPO_ROOT}/assets/icons/kylo-gigi-256.png"
 # (kylo/core/branding.py: LINUX_DESKTOP_ENTRY_FILE_NAME, LINUX_WM_CLASS).
 DESKTOP_FILE_NAME="kylo.desktop"
 # The console command and its earlier name; both ship (kylo.spec builds both).
-CLI_EXE_NAMES=("kylo" "jarvis")
+CLI_EXE_NAMES=("klyo" "kylo")
 ICON_FILE_NAME="kylo.png"
 # usr/share/<name> inside the AppDir; AppRun reads its browser-ui marker there.
 SHARE_DIR_NAME="kylo"

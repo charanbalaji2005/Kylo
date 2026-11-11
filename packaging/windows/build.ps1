@@ -157,7 +157,7 @@ if ($SkipPyInstaller) {
 
 # The windowed launcher under its current and its earlier name, then the CLI
 # under both of its names (kylo.spec).
-foreach ($required in @("KyloApp.exe", "PersonalJarvis.exe", "kylo.exe", "jarvis.exe")) {
+foreach ($required in @("KyloApp.exe", "PersonalJarvis.exe", "klyo.exe", "kylo.exe")) {
     $candidate = Join-Path $BundleDir $required
     if (-not (Test-Path $candidate)) {
         Stop-WithError "the frozen bundle is missing $required (expected at $candidate)"

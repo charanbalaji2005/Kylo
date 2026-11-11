@@ -47,8 +47,13 @@ export function resolveBackendCommand(opts: BackendOptions, port: number, env: N
   const serveArgs = ["serve", "--port", String(port), "--no-lock"];
   if (opts.packaged) {
     const dir = path.join(opts.resourcesPath, "backend");
-    const exe = path.join(dir, process.platform === "win32" ? "kylo.exe" : "kylo");
-    if (!fs.existsSync(exe)) throw new Error(`The Kylo backend is missing from this install (${exe}). Reinstall Kylo.`);
+    const candidates = [
+      path.join(dir, process.platform === "win32" ? "klyo.exe" : "klyo"),
+      path.join(dir, process.platform === "win32" ? "kylo.exe" : "kylo"),
+      path.join(dir, process.platform === "win32" ? "jarvis.exe" : "jarvis"),
+    ];
+    const exe = candidates.find((c) => fs.existsSync(c));
+    if (!exe) throw new Error(`The Klyo backend is missing from this install (${candidates[0]}). Reinstall Klyo.`);
     return { command: exe, args: serveArgs, cwd: dir };
   }
   const repo = env.KYLO_REPO ? path.resolve(env.KYLO_REPO) : path.resolve(opts.appPath, "..");

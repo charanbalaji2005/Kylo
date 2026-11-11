@@ -1,12 +1,12 @@
 """The command name help text and hints should show.
 
-The app answers to ``kylo`` and to its earlier names (``jarvis``,
+The app answers to ``klyo``, ``kylo`` and to its earlier names (``jarvis``,
 ``personal-jarvis``). A usage line or a "run this next" hint is most useful
 when it repeats the name the person actually typed, so the entry points ask
-here: the earlier name when the process was started under one, ``kylo``
+here: the earlier name when the process was started under one, ``klyo``
 otherwise (``python -m kylo``, the frozen executable, a launcher).
 
-Standard library and ``kylo.core.branding`` only: ``kylo update`` imports
+Standard library and ``kylo.core.branding`` only: ``klyo update`` imports
 this before anything heavy is loaded.
 """
 
@@ -19,7 +19,7 @@ from kylo.core.branding import CLI_COMMAND_NAME, LEGACY_CLI_COMMAND_NAMES
 
 
 def main_command(argv0: str | None = None) -> str:
-    """``kylo``, or the earlier command name this process was started under."""
+    """``klyo``, ``kylo``, or the command name this process was started under."""
     stem = Path(sys.argv[0] if argv0 is None else argv0).stem.lower()
     return stem if stem in LEGACY_CLI_COMMAND_NAMES else CLI_COMMAND_NAME
 

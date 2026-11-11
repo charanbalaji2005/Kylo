@@ -1,0 +1,173 @@
+name: Release Desktop App & CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (e.g. v4.1.3, leave empty to use git tag or default)"
+        required: false
+        default: ""
+      draft:
+        description: "Mark release as a draft"
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark release as a pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build & Release Desktop App (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version & Tag
+        id: versioning
+        shell: pwsh
+        run: |
+          if ("${{ github.event.inputs.tag_name }}" -ne "") {
+            $tag = "${{ github.event.inputs.tag_name }}"
+          } elseif ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "v4.1.3"
+          }
+          $cleanVersion = $tag.TrimStart("v")
+          Write-Host "Releasing tag: $tag (version: $cleanVersion)"
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          echo "version=$cleanVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Web UI Frontend
+        shell: pwsh
+        run: |
+          Write-Host "Building React Web UI frontend..."
+          cd kylo/ui/web/frontend
+          npm ci
+          npm run build
+          cd ../../../..
+
+      - name: Install Python Backend Dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install pyinstaller
+          if (Test-Path requirements.txt) {
+            python -m pip install -r requirements.txt
+          }
+          python -m pip install -e . --no-deps
+
+      - name: Freeze Python Backend with PyInstaller
+        shell: pwsh
+        run: |
+          Write-Host "Freezing backend using kylo.spec..."
+          python -m PyInstaller kylo.spec --noconfirm --clean
+          if (-not (Test-Path "dist/Jarvis")) {
+            Write-Error "dist/Jarvis not produced by PyInstaller"
+            exit 1
+          }
+          Write-Host "PyInstaller output verified:"
+          Get-ChildItem -Path "dist/Jarvis" -Filter "*.exe" | ForEach-Object { Write-Host " - $($_.Name)" }
+
+      - name: Package CLI Distribution (klyo CLI tools)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "dist/cli-package" -Force | Out-Null
+          Copy-Item -Path "dist/Jarvis/*" -Destination "dist/cli-package" -Recurse -Force
+          Compress-Archive -Path "dist/cli-package/*" -DestinationPath "dist/klyo-cli-windows-x64.zip" -Force
+          Write-Host "Created dist/klyo-cli-windows-x64.zip"
+
+      - name: Build Electron Desktop Installer
+        shell: pwsh
+        run: |
+          cd desktop
+          npm ci
+          $ver = "${{ steps.versioning.outputs.version }}"
+          npm version $ver --no-git-tag-version --allow-same-version
+          npm run build
+          npm run dist
+          cd ..
+          if (-not (Test-Path "desktop/release")) {
+            Write-Error "desktop/release directory was not created"
+            exit 1
+          }
+          # Generate both Kylo and Klyo installer filenames for user convenience
+          Get-ChildItem -Path "desktop/release" -Filter "*Setup*.exe" | ForEach-Object {
+            $src = $_.FullName
+            $klyoName = $_.Name -ireplace "Kylo", "Klyo"
+            if ($klyoName -ne $_.Name) {
+              Copy-Item -Path $src -Destination (Join-Path "desktop/release" $klyoName) -Force
+              Write-Host "Created alias setup: $klyoName"
+            }
+          }
+
+      - name: Generate Checksums
+        shell: pwsh
+        run: |
+          $releaseFiles = @()
+          $releaseFiles += Get-ChildItem -Path "desktop/release" -Filter "*.exe"
+          $releaseFiles += Get-ChildItem -Path "dist" -Filter "klyo-cli-*.zip"
+          $lines = @()
+          foreach ($file in $releaseFiles) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines += "$hash  $($file.Name)"
+            Write-Host "$hash  $($file.Name)"
+          }
+          $lines | Set-Content -Path "SHA256SUMS.txt" -Encoding utf8
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-windows-x64
+          path: |
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+            dist/klyo-cli-windows-x64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.versioning.outputs.tag }}
+          name: "Release ${{ steps.versioning.outputs.tag }}"
+          draft: ${{ github.event.inputs.draft || false }}
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          generate_release_notes: true
+          files: |
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+            dist/klyo-cli-windows-x64.zip
+            SHA256SUMS.txt
+
